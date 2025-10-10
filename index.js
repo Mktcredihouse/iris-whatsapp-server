@@ -2,112 +2,144 @@ import express from "express";
 import cors from "cors";
 import makeWASocket, {
   useMultiFileAuthState,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore
 } from "@whiskeysockets/baileys";
-import qrcode from "qrcode";
+import P from "pino";
+import { createClient } from "@supabase/supabase-js";
+import fs from "fs";
 
+// ======================
+// 🔐 CONFIGURAÇÕES GERAIS
+// ======================
 const app = express();
-app.use(cors());
-app.use(express.json());
-
 const PORT = process.env.PORT || 10000;
-const WEBHOOK_URL = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook"; // << ajuste aqui se precisar
+app.use(express.json());
+app.use(cors());
 
-let qrCodeData = null;
-let sock;
+// ✅ Config Supabase
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
 
-// Função para iniciar o WhatsApp
+const AUTH_FOLDER = "./auth_info";
+
+// Função para baixar auth do Supabase
+async function restoreAuthInfo() {
+  const { data, error } = await supabase.storage
+    .from("whatsapp-auth")
+    .download("auth.zip");
+
+  if (data) {
+    const fileBuffer = await data.arrayBuffer();
+    fs.writeFileSync("auth.zip", Buffer.from(fileBuffer));
+    console.log("✅ Auth restaurado do Supabase");
+
+    // unzip
+    const unzipper = await import("adm-zip");
+    const zip = new unzipper.default("auth.zip");
+    zip.extractAllTo(AUTH_FOLDER, true);
+    fs.unlinkSync("auth.zip");
+  } else {
+    console.log("⚠️ Nenhum auth.zip encontrado no Supabase (primeira conexão)");
+  }
+}
+
+// Função para salvar auth no Supabase
+async function saveAuthInfo() {
+  const zipper = await import("adm-zip");
+  const zip = new zipper.default();
+  zip.addLocalFolder(AUTH_FOLDER);
+  zip.writeZip("auth.zip");
+
+  const fileBuffer = fs.readFileSync("auth.zip");
+
+  const { error } = await supabase.storage
+    .from("whatsapp-auth")
+    .upload("auth.zip", fileBuffer, { upsert: true });
+
+  fs.unlinkSync("auth.zip");
+
+  if (error) {
+    console.error("❌ Erro ao salvar auth:", error);
+  } else {
+    console.log("✅ Auth salvo no Supabase");
+  }
+}
+
+// ======================
+// 📲 INICIALIZAR BAILEYS
+// ======================
 async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState("./auth_info");
+  await restoreAuthInfo();
+
   const { version } = await fetchLatestBaileysVersion();
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
 
-  sock = makeWASocket({
+  const sock = makeWASocket({
     version,
-    printQRInTerminal: false, // agora não imprime no terminal
-    auth: state,
-    browser: ["Ubuntu", "Chrome", "22.04"]
+    printQRInTerminal: true,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, P({ level: "silent" })),
+    },
+    logger: P({ level: "silent" })
   });
 
-  // Evento de QR
-  sock.ev.on("connection.update", (update) => {
-    const { qr, connection, lastDisconnect } = update;
+  // Evento de atualização da conexão
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect } = update;
 
-    if (qr) {
-      qrCodeData = qr; // guarda o QR para rota /qr
-      console.log("✅ Novo QR Code gerado. Acesse /qr para escanear.");
-    }
-
-    if (connection === "close") {
-      const reason = lastDisconnect?.error?.output?.statusCode;
-      console.log("❌ Conexão encerrada, tentando reconectar...", reason || "");
-      startWhatsApp();
-    } else if (connection === "open") {
+    if (connection === "open") {
       console.log("✅ Conectado ao WhatsApp com sucesso!");
+      await saveAuthInfo();
+    } else if (connection === "close") {
+      console.log("⚠️ Conexão fechada, tentando reconectar...");
+      startWhatsApp();
     }
   });
 
-  // Evento de credenciais atualizadas
+  // Salvar credenciais sempre que forem atualizadas
   sock.ev.on("creds.update", saveCreds);
 
-  // Evento de mensagens recebidas
-  sock.ev.on("messages.upsert", async (m) => {
-    const msg = m.messages[0];
-    if (!msg.key.fromMe && msg.message) {
-      const remoteJid = msg.key.remoteJid;
-      const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+  // Receber mensagens e enviar para o webhook do Lovable
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    const m = messages[0];
+    if (!m.message || m.key.fromMe) return;
 
-      console.log(`📩 Mensagem recebida de ${remoteJid}: ${text}`);
+    const webhookURL = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook";
 
-      // Envia para Lovable via webhook
-      try {
-        await fetch(WEBHOOK_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            remoteJid,
-            message: text,
-            timestamp: Date.now()
-          })
-        });
-      } catch (error) {
-        console.error("❌ Erro ao enviar webhook:", error);
-      }
+    await fetch(webhookURL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        remoteJid: m.key.remoteJid,
+        message: m.message.conversation || m.message.extendedTextMessage?.text,
+        timestamp: m.messageTimestamp,
+      }),
+    });
+  });
+
+  // Endpoint para envio de mensagens via API
+  app.post("/send", async (req, res) => {
+    const { to, message } = req.body;
+
+    try {
+      await sock.sendMessage(to, { text: message });
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Erro ao enviar mensagem:", err);
+      res.status(500).json({ success: false });
     }
   });
 }
 
-// Rota para exibir QR Code como imagem PNG
-app.get("/qr", async (req, res) => {
-  if (!qrCodeData) {
-    return res.status(404).send("Nenhum QR Code disponível no momento.");
-  }
-  try {
-    const qrImage = await qrcode.toBuffer(qrCodeData);
-    res.setHeader("Content-Type", "image/png");
-    res.send(qrImage);
-  } catch (error) {
-    res.status(500).send("Erro ao gerar QR Code.");
-  }
-});
+startWhatsApp();
 
-// Endpoint para envio de mensagens (Lovable → WhatsApp)
-app.post("/send", async (req, res) => {
-  const { to, message } = req.body;
-  if (!to || !message) {
-    return res.status(400).json({ error: "Campos 'to' e 'message' são obrigatórios." });
-  }
-
-  try {
-    await sock.sendMessage(`${to}@s.whatsapp.net`, { text: message });
-    res.json({ success: true });
-  } catch (error) {
-    console.error("Erro ao enviar mensagem:", error);
-    res.status(500).json({ error: "Falha ao enviar mensagem" });
-  }
-});
-
-// Inicia servidor e conexão WhatsApp
+// ======================
+// 🚀 SERVIDOR EXPRESS
+// ======================
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor HTTP rodando na porta ${PORT}`);
-  startWhatsApp();
+  console.log(`🌐 Servidor rodando na porta ${PORT}`);
 });
