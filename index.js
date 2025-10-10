@@ -1,49 +1,37 @@
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys'
+import pino from 'pino'
+import qrcode from 'qrcode-terminal'
 
-// index.js
-const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode');
+async function startSocket() {
+  const { state, saveCreds } = await useMultiFileAuthState('./auth_info')
+  const sock = makeWASocket({
+    printQRInTerminal: true,
+    auth: state,
+    logger: pino({ level: 'silent' }),
+  })
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+  // Evento de QR Code
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update
 
-let qrCodeData = null;
+    if (qr) {
+      console.log('📲 Escaneie este QR Code para conectar:')
+      qrcode.generate(qr, { small: true })
+    }
 
-// Inicia conexão com WhatsApp
-async function startSock() {
-    const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
-    const sock = makeWASocket({ auth: state });
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
+      console.log('❌ Conexão fechada', lastDisconnect?.error)
+      if (shouldReconnect) {
+        startSocket()
+      }
+    } else if (connection === 'open') {
+      console.log('✅ Conectado com sucesso ao WhatsApp!')
+    }
+  })
 
-    sock.ev.on('connection.update', (update) => {
-        const { qr, connection } = update;
-        if (qr) {
-            qrCodeData = qr; // guarda QR
-            console.log("📲 Novo QR gerado");
-        }
-        if (connection === 'open') {
-            console.log("✅ Conectado ao WhatsApp");
-        }
-    });
-
-    sock.ev.on('creds.update', saveCreds);
+  // Evento para salvar sessão automaticamente
+  sock.ev.on('creds.update', saveCreds)
 }
 
-startSock();
-
-// Rota para exibir QR Code
-app.get('/qr', async (req, res) => {
-    if (!qrCodeData) {
-        return res.json({ message: "QR ainda não gerado, atualize em alguns segundos." });
-    }
-    const qrImageUrl = await qrcode.toDataURL(qrCodeData);
-    res.send(`<img src="${qrImageUrl}" />`);
-});
-
-// Teste de status
-app.get('/', (req, res) => {
-    res.send("🚀 Servidor WhatsApp rodando!");
-});
-
-app.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`);
-});
+startSocket()
