@@ -1,63 +1,37 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys'
-import express from 'express'
-import qrcode from 'qrcode-terminal'
-import P from 'pino'
+import express from 'express';
+import { makeWASocket, useMultiFileAuthState } from '@whiskeysockets/baileys';
+import qrcode from 'qrcode-terminal';
+import fs from 'fs';
+import path from 'path';
 
-const app = express()
-app.use(express.json())
+// Define a pasta de autenticação
+const authFolder = './auth_info';
 
-const logger = P({ level: 'info' })
-
-async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info')
-
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: true,
-    logger
-  })
-
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update
-    if (qr) {
-      console.log('📱 Escaneie este QR Code para conectar:')
-      qrcode.generate(qr, { small: true })
-    }
-
-    if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
-      console.log('❌ Conexão fechada. Reconectar?', shouldReconnect)
-      if (shouldReconnect) {
-        startWhatsApp()
-      }
-    } else if (connection === 'open') {
-      console.log('✅ Conectado com sucesso ao WhatsApp!')
-    }
-  })
-
-  sock.ev.on('creds.update', saveCreds)
-
-  // 🌐 Endpoint para enviar mensagens
-  app.post('/send-message', async (req, res) => {
-    const { number, message } = req.body
-    if (!number || !message) {
-      return res.status(400).json({ error: 'Informe number e message no corpo da requisição' })
-    }
-
-    try {
-      const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
-      await sock.sendMessage(jid, { text: message })
-      res.json({ success: true })
-    } catch (error) {
-      console.error('Erro ao enviar mensagem:', error)
-      res.status(500).json({ error: 'Falha ao enviar mensagem' })
-    }
-  })
+// Garante que a pasta existe (se não existir, cria)
+if (!fs.existsSync(authFolder)) {
+  fs.mkdirSync(authFolder, { recursive: true });
 }
 
-startWhatsApp()
+async function startWhatsApp() {
+  // Inicializa o estado de autenticação
+  const { state, saveCreds } = await useMultiFileAuthState(authFolder);
 
-const PORT = process.env.PORT || 3000
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor HTTP rodando na porta ${PORT}`)
-})
+  // Cria conexão com WhatsApp
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: true, // Mostra o QR no terminal
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  console.log('✅ Servidor WhatsApp iniciado');
+}
+
+// Inicia servidor HTTP (Render precisa disso para manter o container ativo)
+const app = express();
+const PORT = process.env.PORT || 10000;
+app.get('/', (req, res) => res.send('Servidor WhatsApp rodando ✅'));
+app.listen(PORT, () => console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`));
+
+// Inicia o bot
+startWhatsApp();
