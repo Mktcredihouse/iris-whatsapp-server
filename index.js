@@ -1,37 +1,42 @@
-import express from 'express';
-import { makeWASocket, useMultiFileAuthState } from '@whiskeysockets/baileys';
-import qrcode from 'qrcode-terminal';
-import fs from 'fs';
-import path from 'path';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys'
+import qrcode from 'qrcode-terminal'
+import express from 'express'
 
-// Define a pasta de autenticação
-const authFolder = './auth_info';
+const app = express()
+const port = process.env.PORT || 10000
 
-// Garante que a pasta existe (se não existir, cria)
-if (!fs.existsSync(authFolder)) {
-  fs.mkdirSync(authFolder, { recursive: true });
-}
+// Inicia servidor HTTP simples só pra manter a instância viva no Render
+app.get('/', (req, res) => res.send('Servidor WhatsApp rodando 🚀'))
+app.listen(port, () => console.log(`🌐 Servidor HTTP rodando na porta ${port}`))
 
 async function startWhatsApp() {
-  // Inicializa o estado de autenticação
-  const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+  const { state, saveCreds } = await useMultiFileAuthState('./auth_info')
 
-  // Cria conexão com WhatsApp
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: true, // Mostra o QR no terminal
-  });
+    printQRInTerminal: false, // Desativado, vamos mostrar manualmente
+    browser: ['Ubuntu', 'Chrome', '22.04'],
+  })
 
-  sock.ev.on('creds.update', saveCreds);
+  // Escuta eventos da conexão
+  sock.ev.on('connection.update', (update) => {
+    const { connection, qr } = update
 
-  console.log('✅ Servidor WhatsApp iniciado');
+    if (qr) {
+      console.log('📲 Escaneie este QR Code para conectar:')
+      qrcode.generate(qr, { small: true }) // 👉 Exibe o QR no terminal
+    }
+
+    if (connection === 'open') {
+      console.log('✅ Conectado com sucesso ao WhatsApp!')
+    } else if (connection === 'close') {
+      console.log('❌ Conexão fechada. Tentando reconectar...')
+      startWhatsApp()
+    }
+  })
+
+  // Salva as credenciais sempre que forem atualizadas
+  sock.ev.on('creds.update', saveCreds)
 }
 
-// Inicia servidor HTTP (Render precisa disso para manter o container ativo)
-const app = express();
-const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('Servidor WhatsApp rodando ✅'));
-app.listen(PORT, () => console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`));
-
-// Inicia o bot
-startWhatsApp();
+startWhatsApp()
