@@ -1,39 +1,12 @@
-import makeWASocket, { useMultiFileAuthState } from '@whiskeysockets/baileys'
 import express from 'express'
-import qrcode from 'qrcode'
+import cors from 'cors'
+import { makeWASocket, useMultiFileAuthState } from '@whiskeysockets/baileys'
 
 const app = express()
-const port = process.env.PORT || 10000
+app.use(cors())
+app.use(express.json())
 
-let currentQR = null // guarda o último QR gerado
-
-// Endpoint para visualizar o QR no navegador
-app.get('/qr', async (req, res) => {
-  if (!currentQR) {
-    return res.send('⚠️ Nenhum QR Code gerado ainda. Aguarde alguns segundos e atualize a página.')
-  }
-
-  try {
-    const qrImage = await qrcode.toDataURL(currentQR)
-    res.send(`
-      <html>
-        <head><title>WhatsApp QR</title></head>
-        <body style="display:flex;align-items:center;justify-content:center;height:100vh;background:#111;">
-          <div>
-            <h2 style="color:white;text-align:center;">📲 Escaneie o QR Code abaixo</h2>
-            <img src="${qrImage}" />
-          </div>
-        </body>
-      </html>
-    `)
-  } catch (err) {
-    console.error(err)
-    res.status(500).send('Erro ao gerar QR')
-  }
-})
-
-// Inicializa servidor HTTP
-app.listen(port, () => console.log(`🌐 Servidor HTTP rodando na porta ${port}`))
+let sockGlobal = null
 
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth_info')
@@ -44,17 +17,12 @@ async function startWhatsApp() {
     browser: ['Ubuntu', 'Chrome', '22.04'],
   })
 
+  sockGlobal = sock
+
   sock.ev.on('connection.update', (update) => {
-    const { connection, qr } = update
-
-    if (qr) {
-      currentQR = qr // salva o QR atual
-      console.log('📡 Novo QR gerado! Acesse /qr para escanear.')
-    }
-
+    const { connection } = update
     if (connection === 'open') {
       console.log('✅ Conectado ao WhatsApp com sucesso!')
-      currentQR = null // limpa QR depois da conexão
     } else if (connection === 'close') {
       console.log('❌ Conexão fechada. Tentando reconectar...')
       startWhatsApp()
@@ -62,6 +30,42 @@ async function startWhatsApp() {
   })
 
   sock.ev.on('creds.update', saveCreds)
+
+  // ✅ Recebendo mensagens
+  sock.ev.on('messages.upsert', async (m) => {
+    const msg = m.messages[0]
+    if (!msg.key.fromMe && msg.message?.conversation) {
+      const texto = msg.message.conversation
+      const remetente = msg.key.remoteJid
+      console.log(`📩 Nova mensagem de ${remetente}: ${texto}`)
+
+      // 👉 Aqui você pode enviar via webhook para Lovable
+      await fetch('https://seu-site-lovable.com/api/webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ number: remetente, message: texto }),
+      })
+    }
+  })
 }
 
 startWhatsApp()
+
+// ✅ Endpoint para enviar mensagens (Lovable → WhatsApp)
+app.post('/send', async (req, res) => {
+  const { number, message } = req.body
+  if (!sockGlobal) return res.status(500).send('Sessão não inicializada')
+
+  try {
+    const jid = number.replace(/\D/g, '') + '@s.whatsapp.net'
+    await sockGlobal.sendMessage(jid, { text: message })
+    res.send({ success: true })
+  } catch (error) {
+    console.error(error)
+    res.status(500).send({ success: false })
+  }
+})
+
+app.listen(10000, () => {
+  console.log('🌐 Servidor HTTP rodando na porta 10000')
+})
