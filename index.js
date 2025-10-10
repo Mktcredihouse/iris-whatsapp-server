@@ -1,12 +1,38 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys'
-import qrcode from 'qrcode-terminal'
+import makeWASocket, { useMultiFileAuthState } from '@whiskeysockets/baileys'
 import express from 'express'
+import qrcode from 'qrcode'
 
 const app = express()
 const port = process.env.PORT || 10000
 
-// Inicia servidor HTTP simples só pra manter a instância viva no Render
-app.get('/', (req, res) => res.send('Servidor WhatsApp rodando 🚀'))
+let currentQR = null // guarda o último QR gerado
+
+// Endpoint para visualizar o QR no navegador
+app.get('/qr', async (req, res) => {
+  if (!currentQR) {
+    return res.send('⚠️ Nenhum QR Code gerado ainda. Aguarde alguns segundos e atualize a página.')
+  }
+
+  try {
+    const qrImage = await qrcode.toDataURL(currentQR)
+    res.send(`
+      <html>
+        <head><title>WhatsApp QR</title></head>
+        <body style="display:flex;align-items:center;justify-content:center;height:100vh;background:#111;">
+          <div>
+            <h2 style="color:white;text-align:center;">📲 Escaneie o QR Code abaixo</h2>
+            <img src="${qrImage}" />
+          </div>
+        </body>
+      </html>
+    `)
+  } catch (err) {
+    console.error(err)
+    res.status(500).send('Erro ao gerar QR')
+  }
+})
+
+// Inicializa servidor HTTP
 app.listen(port, () => console.log(`🌐 Servidor HTTP rodando na porta ${port}`))
 
 async function startWhatsApp() {
@@ -14,29 +40,9 @@ async function startWhatsApp() {
 
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false, // Desativado, vamos mostrar manualmente
+    printQRInTerminal: false,
     browser: ['Ubuntu', 'Chrome', '22.04'],
   })
 
-  // Escuta eventos da conexão
   sock.ev.on('connection.update', (update) => {
-    const { connection, qr } = update
-
-    if (qr) {
-      console.log('📲 Escaneie este QR Code para conectar:')
-      qrcode.generate(qr, { small: true }) // 👉 Exibe o QR no terminal
-    }
-
-    if (connection === 'open') {
-      console.log('✅ Conectado com sucesso ao WhatsApp!')
-    } else if (connection === 'close') {
-      console.log('❌ Conexão fechada. Tentando reconectar...')
-      startWhatsApp()
-    }
-  })
-
-  // Salva as credenciais sempre que forem atualizadas
-  sock.ev.on('creds.update', saveCreds)
-}
-
-startWhatsApp()
+    const { connection, qr } = up
