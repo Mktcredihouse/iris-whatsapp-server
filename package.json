@@ -1,16 +1,40 @@
 {
   "name": "iris-whatsapp-server",
   "version": "1.0.0",
-  "description": "Servidor WhatsApp usando Baileys + Express + integração com Lovable",
+  "description": "Servidor Baileys integrado com Supabase e Lovable para atendimento via WhatsApp",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "supabase",
+    "express",
+    "lovable",
+    "nodejs",
+    "webhook",
+    "crm",
+    "render"
+  ],
+  "author": "Credlar Construtora - Iris Connect Manager",
+  "license": "MIT",
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.5",
+    "@supabase/supabase-js": "^2.45.0",
+    "@whiskeysockets/baileys": "^6.7.8",
+    "adm-zip": "^0.5.10",
     "cors": "^2.8.5",
     "express": "^4.18.2",
-    "qrcode": "^1.5.3"
+    "pino": "^8.17.0",
+    "qrcode": "^1.5.3",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.x"
   }
 }
