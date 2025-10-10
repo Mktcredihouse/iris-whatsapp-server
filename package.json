@@ -1,0 +1,14 @@
+{
+  "name": "iris-whatsapp-server",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "@whiskeysockets/baileys": "^6.7.5",
+    "qrcode": "^1.5.3"
+  }
+}
