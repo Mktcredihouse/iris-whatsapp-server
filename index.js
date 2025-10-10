@@ -45,4 +45,23 @@ async function startWhatsApp() {
   })
 
   sock.ev.on('connection.update', (update) => {
-    const { connection, qr } = up
+    const { connection, qr } = update
+
+    if (qr) {
+      currentQR = qr // salva o QR atual
+      console.log('📡 Novo QR gerado! Acesse /qr para escanear.')
+    }
+
+    if (connection === 'open') {
+      console.log('✅ Conectado ao WhatsApp com sucesso!')
+      currentQR = null // limpa QR depois da conexão
+    } else if (connection === 'close') {
+      console.log('❌ Conexão fechada. Tentando reconectar...')
+      startWhatsApp()
+    }
+  })
+
+  sock.ev.on('creds.update', saveCreds)
+}
+
+startWhatsApp()
