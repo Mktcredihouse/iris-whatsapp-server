@@ -1,127 +1,113 @@
-// index.js
-
 import express from "express";
 import cors from "cors";
-import { createServer } from "http";
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys";
-import fs from "fs";
-import path from "path";
+import makeWASocket, {
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion
+} from "@whiskeysockets/baileys";
+import qrcode from "qrcode";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-const AUTH_FOLDER = "./auth_info";
+const WEBHOOK_URL = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook"; // << ajuste aqui se precisar
 
-// 🔹 Função principal de inicialização do WhatsApp
+let qrCodeData = null;
+let sock;
+
+// Função para iniciar o WhatsApp
 async function startWhatsApp() {
-  // Garante que a pasta de autenticação exista
-  if (!fs.existsSync(AUTH_FOLDER)) {
-    fs.mkdirSync(AUTH_FOLDER);
-  }
+  const { state, saveCreds } = await useMultiFileAuthState("./auth_info");
+  const { version } = await fetchLatestBaileysVersion();
 
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
-
-  const sock = makeWASocket({
+  sock = makeWASocket({
+    version,
+    printQRInTerminal: false, // agora não imprime no terminal
     auth: state,
-    printQRInTerminal: true, // exibe QR no log da Render
-    browser: ["Ubuntu", "Chrome", "22.04"],
+    browser: ["Ubuntu", "Chrome", "22.04"]
   });
 
-  // Salva credenciais ao atualizar
-  sock.ev.on("creds.update", saveCreds);
-
-  // Escuta eventos de conexão
+  // Evento de QR
   sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect } = update;
+    const { qr, connection, lastDisconnect } = update;
+
+    if (qr) {
+      qrCodeData = qr; // guarda o QR para rota /qr
+      console.log("✅ Novo QR Code gerado. Acesse /qr para escanear.");
+    }
 
     if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log("❌ Conexão encerrada. Reconectar:", shouldReconnect);
-      if (shouldReconnect) startWhatsApp();
+      const reason = lastDisconnect?.error?.output?.statusCode;
+      console.log("❌ Conexão encerrada, tentando reconectar...", reason || "");
+      startWhatsApp();
     } else if (connection === "open") {
       console.log("✅ Conectado ao WhatsApp com sucesso!");
     }
-
-    if (update.qr) {
-      console.log("📱 Escaneie este QR Code para conectar:");
-    }
   });
 
-  // Recebendo mensagens
-  sock.ev.on("messages.upsert", async (msg) => {
-    console.log("📨 Mensagem recebida:", JSON.stringify(msg, null, 2));
+  // Evento de credenciais atualizadas
+  sock.ev.on("creds.update", saveCreds);
 
-    const message = msg.messages[0];
-    if (!message.key.fromMe && message.message?.conversation) {
-      const from = message.key.remoteJid;
-      const text = message.message.conversation;
+  // Evento de mensagens recebidas
+  sock.ev.on("messages.upsert", async (m) => {
+    const msg = m.messages[0];
+    if (!msg.key.fromMe && msg.message) {
+      const remoteJid = msg.key.remoteJid;
+      const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
 
-      console.log(`👤 ${from} disse: ${text}`);
+      console.log(`📩 Mensagem recebida de ${remoteJid}: ${text}`);
 
-      // Você pode responder automaticamente aqui, se quiser:
-      // await sock.sendMessage(from, { text: "Recebi sua mensagem ✅" });
-
-      // OU enviar para o webhook Lovable
-      await sendToWebhook({ from, text });
+      // Envia para Lovable via webhook
+      try {
+        await fetch(WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            remoteJid,
+            message: text,
+            timestamp: Date.now()
+          })
+        });
+      } catch (error) {
+        console.error("❌ Erro ao enviar webhook:", error);
+      }
     }
   });
-
-  // Função para enviar mensagens via API
-  app.post("/send", async (req, res) => {
-    const { number, message } = req.body;
-
-    if (!number || !message) {
-      return res.status(400).json({ error: "Número e mensagem são obrigatórios" });
-    }
-
-    try {
-      await sock.sendMessage(`${number}@s.whatsapp.net`, { text: message });
-      res.json({ success: true });
-    } catch (error) {
-      console.error("Erro ao enviar mensagem:", error);
-      res.status(500).json({ error: "Falha ao enviar mensagem" });
-    }
-  });
-
-  console.log("🌐 Servidor WhatsApp inicializado");
 }
 
-// 🔹 Webhook para receber mensagens da Lovable (Supabase)
-app.post("/webhook", async (req, res) => {
-  console.log("🌍 Webhook Lovable recebido:", req.body);
-  // Aqui você pode tratar os dados vindos da Lovable para enviar mensagens via Baileys
-  res.sendStatus(200);
+// Rota para exibir QR Code como imagem PNG
+app.get("/qr", async (req, res) => {
+  if (!qrCodeData) {
+    return res.status(404).send("Nenhum QR Code disponível no momento.");
+  }
+  try {
+    const qrImage = await qrcode.toBuffer(qrCodeData);
+    res.setHeader("Content-Type", "image/png");
+    res.send(qrImage);
+  } catch (error) {
+    res.status(500).send("Erro ao gerar QR Code.");
+  }
 });
 
-// 🔸 Função para repassar mensagens recebidas para o webhook Lovable
-async function sendToWebhook(data) {
-  const webhookURL = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook";
+// Endpoint para envio de mensagens (Lovable → WhatsApp)
+app.post("/send", async (req, res) => {
+  const { to, message } = req.body;
+  if (!to || !message) {
+    return res.status(400).json({ error: "Campos 'to' e 'message' são obrigatórios." });
+  }
 
   try {
-    const response = await fetch(webhookURL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
-
-    console.log(`📡 Enviado para webhook (${response.status})`);
+    await sock.sendMessage(`${to}@s.whatsapp.net`, { text: message });
+    res.json({ success: true });
   } catch (error) {
-    console.error("Erro ao enviar para webhook:", error);
+    console.error("Erro ao enviar mensagem:", error);
+    res.status(500).json({ error: "Falha ao enviar mensagem" });
   }
-}
-
-// 🟢 Endpoint raiz
-app.get("/", (req, res) => {
-  res.send("✅ Servidor WhatsApp ativo e rodando!");
 });
 
-// Inicia servidor HTTP
-createServer(app).listen(PORT, () => {
+// Inicia servidor e conexão WhatsApp
+app.listen(PORT, () => {
   console.log(`🚀 Servidor HTTP rodando na porta ${PORT}`);
+  startWhatsApp();
 });
-
-// Inicializa Baileys
-startWhatsApp();
