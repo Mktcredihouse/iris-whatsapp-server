@@ -1,71 +1,127 @@
-import express from 'express'
-import cors from 'cors'
-import { makeWASocket, useMultiFileAuthState } from '@whiskeysockets/baileys'
+// index.js
 
-const app = express()
-app.use(cors())
-app.use(express.json())
+import express from "express";
+import cors from "cors";
+import { createServer } from "http";
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys";
+import fs from "fs";
+import path from "path";
 
-let sockGlobal = null
+const app = express();
+app.use(cors());
+app.use(express.json());
 
+const PORT = process.env.PORT || 10000;
+const AUTH_FOLDER = "./auth_info";
+
+// 🔹 Função principal de inicialização do WhatsApp
 async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('./auth_info')
+  // Garante que a pasta de autenticação exista
+  if (!fs.existsSync(AUTH_FOLDER)) {
+    fs.mkdirSync(AUTH_FOLDER);
+  }
+
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
 
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false,
-    browser: ['Ubuntu', 'Chrome', '22.04'],
-  })
+    printQRInTerminal: true, // exibe QR no log da Render
+    browser: ["Ubuntu", "Chrome", "22.04"],
+  });
 
-  sockGlobal = sock
+  // Salva credenciais ao atualizar
+  sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection } = update
-    if (connection === 'open') {
-      console.log('✅ Conectado ao WhatsApp com sucesso!')
-    } else if (connection === 'close') {
-      console.log('❌ Conexão fechada. Tentando reconectar...')
-      startWhatsApp()
+  // Escuta eventos de conexão
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect } = update;
+
+    if (connection === "close") {
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log("❌ Conexão encerrada. Reconectar:", shouldReconnect);
+      if (shouldReconnect) startWhatsApp();
+    } else if (connection === "open") {
+      console.log("✅ Conectado ao WhatsApp com sucesso!");
     }
-  })
 
-  sock.ev.on('creds.update', saveCreds)
-
-  // ✅ Recebendo mensagens
-  sock.ev.on('messages.upsert', async (m) => {
-    const msg = m.messages[0]
-    if (!msg.key.fromMe && msg.message?.conversation) {
-      const texto = msg.message.conversation
-      const remetente = msg.key.remoteJid
-      console.log(`📩 Nova mensagem de ${remetente}: ${texto}`)
-
-      // 👉 Aqui você pode enviar via webhook para Lovable
-      await fetch('https://seu-site-lovable.com/api/webhook', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ number: remetente, message: texto }),
-      })
+    if (update.qr) {
+      console.log("📱 Escaneie este QR Code para conectar:");
     }
-  })
+  });
+
+  // Recebendo mensagens
+  sock.ev.on("messages.upsert", async (msg) => {
+    console.log("📨 Mensagem recebida:", JSON.stringify(msg, null, 2));
+
+    const message = msg.messages[0];
+    if (!message.key.fromMe && message.message?.conversation) {
+      const from = message.key.remoteJid;
+      const text = message.message.conversation;
+
+      console.log(`👤 ${from} disse: ${text}`);
+
+      // Você pode responder automaticamente aqui, se quiser:
+      // await sock.sendMessage(from, { text: "Recebi sua mensagem ✅" });
+
+      // OU enviar para o webhook Lovable
+      await sendToWebhook({ from, text });
+    }
+  });
+
+  // Função para enviar mensagens via API
+  app.post("/send", async (req, res) => {
+    const { number, message } = req.body;
+
+    if (!number || !message) {
+      return res.status(400).json({ error: "Número e mensagem são obrigatórios" });
+    }
+
+    try {
+      await sock.sendMessage(`${number}@s.whatsapp.net`, { text: message });
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Erro ao enviar mensagem:", error);
+      res.status(500).json({ error: "Falha ao enviar mensagem" });
+    }
+  });
+
+  console.log("🌐 Servidor WhatsApp inicializado");
 }
 
-startWhatsApp()
+// 🔹 Webhook para receber mensagens da Lovable (Supabase)
+app.post("/webhook", async (req, res) => {
+  console.log("🌍 Webhook Lovable recebido:", req.body);
+  // Aqui você pode tratar os dados vindos da Lovable para enviar mensagens via Baileys
+  res.sendStatus(200);
+});
 
-// ✅ Endpoint para enviar mensagens (Lovable → WhatsApp)
-app.post('/send', async (req, res) => {
-  const { number, message } = req.body
-  if (!sockGlobal) return res.status(500).send('Sessão não inicializada')
+// 🔸 Função para repassar mensagens recebidas para o webhook Lovable
+async function sendToWebhook(data) {
+  const webhookURL = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook";
 
   try {
-    const jid = number.replace(/\D/g, '') + '@s.whatsapp.net'
-    await sockGlobal.sendMessage(jid, { text: message })
-    res.send({ success: true })
-  } catch (error) {
-    console.error(error)
-    res.status(500).send({ success: false })
-  }
-})
+    const response = await fetch(webhookURL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
 
-app.listen(10000, () => {
-  console.log('🌐 Servidor HTTP rodando na porta 10000')
-})
+    console.log(`📡 Enviado para webhook (${response.status})`);
+  } catch (error) {
+    console.error("Erro ao enviar para webhook:", error);
+  }
+}
+
+// 🟢 Endpoint raiz
+app.get("/", (req, res) => {
+  res.send("✅ Servidor WhatsApp ativo e rodando!");
+});
+
+// Inicia servidor HTTP
+createServer(app).listen(PORT, () => {
+  console.log(`🚀 Servidor HTTP rodando na porta ${PORT}`);
+});
+
+// Inicializa Baileys
+startWhatsApp();
