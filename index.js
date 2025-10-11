@@ -1,133 +1,52 @@
-// index.js – ESM
 import express from "express";
-import QRCode from "qrcode";
-import pino from "pino";
-import fs from "fs/promises";
-import path from "path";
-import { fileURLToPath } from "url";
-import fetch from "node-fetch";
-import {
-  makeWASocket,
+import qrcode from "qrcode-terminal";
+import makeWASocket, {
   useMultiFileAuthState,
   makeCacheableSignalKeyStore,
-  DisconnectReason,
   fetchLatestBaileysVersion,
+  DisconnectReason
 } from "@whiskeysockets/baileys";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const PORT = process.env.PORT || 10000;
-const SESSION_ID = process.env.SESSION_ID || "iris-session";
-const SESSION_DIR = path.join(process.cwd(), SESSION_ID);
-const WEBHOOK_URL = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook"; // 👈 webhook Lovable
-
-const log = pino({ level: "info" });
-
-// cache do QR p/ a rota /qr
-let lastQRString = null;
-let lastQRPng = null;
-let qrUpdatedAt = 0;
-let isConnected = false;
+import P from "pino";
+import fs from "fs";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
-/* -------------------------- Rotas HTTP -------------------------- */
+const SESSION_DIR = "./auth_info_baileys";
+const PORT = 10000;
+const WEBHOOK_URL = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook";
 
-app.get("/qr", async (req, res) => {
-  if (isConnected) {
-    return res.send(
-      `<h1>Já conectado ✅</h1><p>Se precisar gerar um novo QR, faça logout em /logout.</p>`
-    );
-  }
-  if (lastQRPng) {
-    res.writeHead(200, {
-      "Content-Type": "image/png",
-      "Cache-Control": "no-store",
-    });
-    res.end(lastQRPng);
-  } else {
-    res.send("QR code ainda não disponível.");
-  }
-});
+let sock;
 
-app.get("/logout", async (req, res) => {
-  try {
-    await fs.rm(SESSION_DIR, { recursive: true, force: true });
-    res.send("Sessão encerrada. Reinicie o servidor para gerar novo QR.");
-    process.exit(0);
-  } catch (err) {
-    console.error("Erro ao fazer logout:", err);
-    res.status(500).send("Erro ao fazer logout.");
-  }
-});
-
-app.post("/send", async (req, res) => {
-  const { to, message } = req.body;
-  if (!sock || !to || !message) {
-    return res.status(400).send({ error: "Parâmetros inválidos." });
-  }
-  try {
-    await sock.sendMessage(to, { text: message });
-    res.send({ success: true });
-  } catch (error) {
-    console.error("Erro ao enviar mensagem:", error);
-    res.status(500).send({ error: "Erro ao enviar mensagem." });
-  }
-});
-
-/* -------------------------- Socket Baileys -------------------------- */
-
+// Função principal de conexão com o WhatsApp
 async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
-  const sock = makeWASocket({
+  sock = makeWASocket({
     version,
-    printQRInTerminal: true,
+    logger: P({ level: "fatal" }),
+    printQRInTerminal: false,
     auth: {
       creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, log),
+      keys: makeCacheableSignalKeyStore(state.keys, P({ level: "silent" })),
     },
+    browser: ["Ubuntu", "Chrome", "22.04"],
   });
 
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      lastQRString = qr;
-      QRCode.toBuffer(qr).then((png) => {
-        lastQRPng = png;
-        qrUpdatedAt = Date.now();
-      });
-    }
-
-    if (connection === "open") {
-      console.log("✅ Conectado ao WhatsApp!");
-      isConnected = true;
-    } else if (connection === "close") {
-      const reason = lastDisconnect?.error?.output?.statusCode;
-      console.log("Conexão fechada:", reason);
-      isConnected = false;
-      setTimeout(startSock, 5000);
-    }
-  });
-
-  sock.ev.on("creds.update", saveCreds);
-
-  // 🚀 Envio de Webhooks Lovable
+  // =================== Webhook Lovable ===================
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages[0];
     if (!msg.message || msg.key.fromMe) return;
 
     const payload = {
-      de: msg.key.remoteJid,
-      mensagem:
+      from: msg.key.remoteJid,
+      message:
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
-        "",
-      nome: msg.pushName || "Contato desconhecido",
+        "[Mídia]",
+      name: msg.pushName || "Contato desconhecido",
     };
 
     try {
@@ -136,20 +55,71 @@ async function startSock() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      console.log("📡 Webhook enviado para Lovable:", payload);
+      console.log("📤 Webhook enviado para Lovable:", payload);
     } catch (error) {
       console.error("Erro ao enviar webhook:", error);
     }
   });
+  // =================== Fim Webhook Lovable ===================
 
-  return sock;
+  // =================== Conexão e QR Code ===================
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log("\n📱 ESCANEIE O QR CODE ABAIXO PARA CONECTAR AO WHATSAPP:\n");
+      qrcode.generate(qr, { small: true });
+    }
+
+    if (connection === "open") {
+      console.log("✅ Conectado ao WhatsApp com sucesso!");
+    } else if (connection === "close") {
+      const reason = lastDisconnect?.error?.output?.statusCode;
+      console.log("❌ Conexão encerrada:", reason);
+      setTimeout(startSock, 5000);
+    }
+  });
+
+  sock.ev.on("creds.update", saveCreds);
 }
 
-let sock;
-startSock();
+// =================== Endpoint: Enviar mensagem ===================
+app.post("/send", async (req, res) => {
+  const { number, message } = req.body;
+  try {
+    await sock.sendMessage(`${number}@s.whatsapp.net`, { text: message });
+    res.json({ status: "ok", number, message });
+  } catch (error) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
 
-/* -------------------------- Inicialização -------------------------- */
+// =================== Endpoint: Logout manual ===================
+app.get("/logout", async (req, res) => {
+  try {
+    await sock.logout();
+    res.json({ status: "ok", message: "Sessão encerrada com sucesso." });
+  } catch (error) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
 
+// =================== Endpoint: Status ===================
+app.get("/status", (req, res) => {
+  const isConnected = sock?.user ? true : false;
+  const number = sock?.user?.id ? sock.user.id.split(":")[0] : null;
+
+  res.json({
+    status: "online",
+    mensagem: "Servidor rodando e pronto para integração com Lovable!",
+    conectado: isConnected,
+    number: number,
+  });
+});
+
+// =================== Inicialização ===================
 app.listen(PORT, () => {
   console.log(`🚀 Servidor rodando na porta ${PORT}`);
 });
+
+startSock();
