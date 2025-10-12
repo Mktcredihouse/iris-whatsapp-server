@@ -1,34 +1,29 @@
 import express from "express";
-import qrcode from "qrcode-terminal";
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason
-} from "@whiskeysockets/baileys";
 import fetch from "node-fetch";
+import makeWASocket, {
+  DisconnectReason,
+  useMultiFileAuthState
+} from "@whiskeysockets/baileys";
+import qrcode from "qrcode-terminal";
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-const WEBHOOK_URL = "https://seu-endpoint-do-lovable.com/webhook"; // 🔧 Substitua se necessário
+const WEBHOOK_URL = "https://lovable.run/api/webhook"; // altere se tiver outro
 
-// ============================
-// 🔌 Inicialização do WhatsApp
-// ============================
+let sock; // 🔹 variável global
+
+// ==================== FUNÇÃO DE CONEXÃO ====================
 async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
-
-  const sock = makeWASocket({
+  sock = makeWASocket({
     printQRInTerminal: true,
-    auth: state,
+    auth: state
   });
 
-  // 🔁 Atualiza credenciais sempre que algo mudar
   sock.ev.on("creds.update", saveCreds);
 
-  // =========================
-  // 📲 Eventos de Conexão
-  // =========================
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -39,21 +34,16 @@ async function startSock() {
 
     if (connection === "open") {
       console.log("✅ Conectado ao WhatsApp!");
+      global.sock = sock; // 🔥 Define como global (fundamental!)
     } else if (connection === "close") {
       const shouldReconnect =
         lastDisconnect?.error?.output?.statusCode !==
         DisconnectReason.loggedOut;
-      console.log(
-        "⚠️ Conexão encerrada. Tentando reconectar:",
-        shouldReconnect
-      );
+      console.log("⚠️ Conexão encerrada. Tentando reconectar:", shouldReconnect);
       if (shouldReconnect) startSock();
     }
   });
 
-  // =========================
-  // 💬 Eventos de Mensagens
-  // =========================
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages[0];
     if (!msg.message || msg.key.fromMe) return;
@@ -64,14 +54,14 @@ async function startSock() {
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
         "",
-      nome: msg.pushName || "Contato desconhecido",
+      nome: msg.pushName || "Contato desconhecido"
     };
 
     try {
       await fetch(WEBHOOK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(payload)
       });
       console.log("📩 Webhook enviado para Lovable:", payload);
     } catch (error) {
@@ -82,17 +72,9 @@ async function startSock() {
   return sock;
 }
 
-// Variável global do socket
-let sock;
+// ==================== ENDPOINTS ====================
 
-// Inicia o socket
-startSock().then((s) => {
-  sock = s;
-});
-
-// =============================
-// 🚀 Endpoint: Enviar Mensagem
-// =============================
+// Enviar mensagem manualmente
 app.post("/send", async (req, res) => {
   const { number, message } = req.body;
   try {
@@ -103,9 +85,7 @@ app.post("/send", async (req, res) => {
   }
 });
 
-// =============================
-// 🔐 Endpoint: Logout Manual
-// =============================
+// Encerrar sessão manualmente
 app.get("/logout", async (req, res) => {
   try {
     await sock.logout();
@@ -115,24 +95,24 @@ app.get("/logout", async (req, res) => {
   }
 });
 
-// =============================
-// 📊 Endpoint: Status do Servidor
-// =============================
+// STATUS atualizado
 app.get("/status", (req, res) => {
-  const isConnected = !!sock?.user; // verifica se há sessão ativa
-  const number = sock?.user?.id ? sock.user.id.split(":")[0] : null; // pega o número do WhatsApp
+  const isConnected = !!global.sock?.user;
+  const number = global.sock?.user?.id
+    ? global.sock.user.id.split(":")[0]
+    : null;
 
   res.json({
     status: "online",
     mensagem: "Servidor rodando e pronto para integração com Lovable!",
     conectado: isConnected,
-    number: number,
+    number
   });
 });
 
-// =============================
-// 🟢 Inicialização do Servidor
-// =============================
+// ==================== INICIALIZAÇÃO ====================
+startSock();
+
 app.listen(PORT, () => {
   console.log(`🚀 Servidor rodando na porta ${PORT}`);
 });
