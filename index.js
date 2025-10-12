@@ -9,7 +9,9 @@ import fs from "fs";
 const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 10000;
-const WEBHOOK_URL = process.env.WEBHOOK_URL || null;
+
+// URL do Webhook da IRIS
+const WEBHOOK_URL = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook";
 
 let sock;
 
@@ -23,10 +25,10 @@ async function startSock() {
     browser: ["Ubuntu", "Chrome", "22.04.4"],
   });
 
-  // Salva credenciais ao atualizar
+  // Salva credenciais
   sock.ev.on("creds.update", saveCreds);
 
-  // Atualizações de conexão
+  // Atualização de conexão
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -45,41 +47,55 @@ async function startSock() {
     }
   });
 
-  // Recebe mensagens novas
+  // ==================== NOVO BLOCO IMPORTANTE ====================
+  // Envia mensagens recebidas para o webhook da IRIS
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages[0];
-    if (!msg.message || msg.key.fromMe) return;
+    if (!msg.message || msg.key.fromMe) return; // Ignora mensagens enviadas por você
+
+    const de = msg.key.remoteJid;
+    const texto =
+      msg.message.conversation ||
+      msg.message.extendedTextMessage?.text ||
+      msg.message?.imageMessage?.caption ||
+      "";
+    const nome = msg.pushName || "Cliente";
 
     const payload = {
-      de: msg.key.remoteJid,
-      mensagem:
-        msg.message.conversation || msg.message.extendedTextMessage?.text || "",
-      nome: msg.pushName || "Contato desconhecido",
+      de,
+      mensagem: texto,
+      nome,
+      timestamp: Date.now(),
     };
 
-    if (WEBHOOK_URL) {
-      try {
-        await fetch(WEBHOOK_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        console.log("📩 Webhook enviado para Lovable:", payload);
-      } catch (err) {
-        console.error("❌ Erro ao enviar webhook:", err);
+    console.log("📩 Mensagem recebida:", payload);
+
+    try {
+      const response = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.ok) {
+        console.log("📨 Mensagem encaminhada ao webhook IRIS com sucesso!");
+      } else {
+        console.error("⚠️ Erro ao enviar webhook IRIS:", await response.text());
       }
+    } catch (error) {
+      console.error("❌ Erro ao enviar para o webhook:", error);
     }
   });
 
   return sock;
 }
 
-// ==================== Inicializa Conexão ====================
+// ==================== Inicializa conexão ====================
 startSock();
 
 // ==================== ENDPOINTS ====================
 
-// ---------- Status ----------
+// ---------- STATUS ----------
 app.get("/status", (req, res) => {
   const isConnected = sock?.user ? true : false;
   const number = sock?.user?.id ? sock.user.id.split(":")[0] : null;
@@ -92,10 +108,9 @@ app.get("/status", (req, res) => {
   });
 });
 
-// ---------- Envio de Mensagens ----------
+// ---------- ENVIO DE MENSAGEM ----------
 app.post("/send", async (req, res) => {
   try {
-    // Aceita formatos variados do Lovable
     const to = req.body.to || req.body.number || req.body.telefone;
     const text = req.body.text || req.body.message || req.body.mensagem;
 
@@ -107,33 +122,22 @@ app.post("/send", async (req, res) => {
       });
     }
 
-    // Limpa o número (remove tudo que não for dígito)
     const cleanNumber = to.replace(/\D/g, "");
-
-    // Adiciona o sufixo do WhatsApp se necessário
     const jid = cleanNumber.includes("@s.whatsapp.net")
       ? cleanNumber
       : `${cleanNumber}@s.whatsapp.net`;
 
-    // Envia a mensagem
     await sock.sendMessage(jid, { text });
     console.log("📤 Mensagem enviada com sucesso para:", jid);
 
-    res.json({
-      status: "ok",
-      para: jid,
-      mensagem: text,
-    });
+    res.json({ status: "ok", para: jid, mensagem: text });
   } catch (error) {
     console.error("❌ Erro ao enviar mensagem:", error);
-    res.status(500).json({
-      status: "error",
-      message: error.message,
-    });
+    res.status(500).json({ status: "error", message: error.message });
   }
 });
 
-// ---------- Logout Manual ----------
+// ---------- LOGOUT ----------
 app.get("/logout", async (req, res) => {
   try {
     await sock.logout();
@@ -143,7 +147,7 @@ app.get("/logout", async (req, res) => {
   }
 });
 
-// ---------- Inicialização ----------
+// ---------- START SERVER ----------
 app.listen(PORT, () => {
   console.log(`🚀 Servidor rodando na porta ${PORT}`);
 });
