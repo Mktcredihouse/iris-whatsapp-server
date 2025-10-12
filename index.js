@@ -1,153 +1,119 @@
-// ==================== Importações ====================
-import express from "express";
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys";
-import qrcode from "qrcode-terminal";
-import fetch from "node-fetch";
-import fs from "fs";
+import makeWASocket, {
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason
+} from '@whiskeysockets/baileys'
+import { createClient } from '@supabase/supabase-js'
+import P from 'pino'
+import express from 'express'
+import qrcode from 'qrcode-terminal'
 
-// ==================== Configuração ====================
-const app = express();
-app.use(express.json());
-const PORT = process.env.PORT || 10000;
+// ================================
+// 🔧 CONFIGURAÇÕES GERAIS
+// ================================
+const PORT = process.env.PORT || 3000
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNzYnV3cGVhc2JreG9ib3dmeXZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NzA4MjEsImV4cCI6MjA3NTQ0NjgyMX0.plDzeNZQZEv8-3OX09VSTAUURq01zLm0PXxc2KdPAuY"
 
-// URL do Webhook da IRIS
-const WEBHOOK_URL = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook";
+// Inicializa Supabase
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-let sock;
+// Inicializa Express para webhook ou endpoints locais
+const app = express()
+app.use(express.json())
 
-// ==================== Função principal ====================
-async function startSock() {
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
-
-  sock = makeWASocket({
+// ================================
+// 🔐 INICIALIZAÇÃO DO BAILEYS
+// ================================
+async function connectToWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState('./session')
+  const { version } = await fetchLatestBaileysVersion()
+  
+  const sock = makeWASocket({
+    version,
     printQRInTerminal: true,
     auth: state,
-    browser: ["Ubuntu", "Chrome", "22.04.4"],
-  });
+    logger: P({ level: 'silent' }),
+    browser: ['Iris CRM', 'Chrome', '4.0']
+  })
 
-  // Salva credenciais
-  sock.ev.on("creds.update", saveCreds);
-
-  // Atualização de conexão
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
+  // ================================
+  // 📲 QR CODE GERADO
+  // ================================
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update
     if (qr) {
-      console.log("🔄 Escaneie este QR Code para conectar ao WhatsApp:");
-      qrcode.generate(qr, { small: true });
+      console.clear()
+      console.log('📱 Escaneie o QR Code abaixo para conectar o WhatsApp:')
+      qrcode.generate(qr, { small: true })
     }
 
-    if (connection === "open") {
-      console.log("✅ Conectado ao WhatsApp!");
-    } else if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log("⚠️ Conexão encerrada. Reconnecting:", shouldReconnect);
-      if (shouldReconnect) startSock();
-    }
-  });
-
-  // ==================== NOVO BLOCO IMPORTANTE ====================
-  // Envia mensagens recebidas para o webhook da IRIS
-  sock.ev.on("messages.upsert", async (m) => {
-    const msg = m.messages[0];
-    if (!msg.message || msg.key.fromMe) return; // Ignora mensagens enviadas por você
-
-    const de = msg.key.remoteJid;
-    const texto =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      msg.message?.imageMessage?.caption ||
-      "";
-    const nome = msg.pushName || "Cliente";
-
-    const payload = {
-      de,
-      mensagem: texto,
-      nome,
-      timestamp: Date.now(),
-    };
-
-    console.log("📩 Mensagem recebida:", payload);
-
-    try {
-      const response = await fetch(WEBHOOK_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      if (response.ok) {
-        console.log("📨 Mensagem encaminhada ao webhook IRIS com sucesso!");
+    if (connection === 'close') {
+      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
+      if (reason === DisconnectReason.loggedOut) {
+        console.log('❌ Sessão encerrada. Apague a pasta "session" e reconecte.')
       } else {
-        console.error("⚠️ Erro ao enviar webhook IRIS:", await response.text());
+        console.log('🔄 Reconectando...')
+        connectToWhatsApp()
       }
-    } catch (error) {
-      console.error("❌ Erro ao enviar para o webhook:", error);
     }
-  });
 
-  return sock;
+    if (connection === 'open') {
+      console.log('✅ WhatsApp conectado com sucesso!')
+      await supabase
+        .from('whatsapp_connection')
+        .insert([{ status: 'connected', updated_at: new Date() }])
+    }
+  })
+
+  // ================================
+  // 💬 RECEBIMENTO DE MENSAGENS
+  // ================================
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0]
+    if (!msg.message) return
+
+    const sender = msg.key.remoteJid
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text
+
+    console.log(`📩 Mensagem recebida de ${sender}: ${text}`)
+
+    // Salva no banco de dados Lovable (Supabase)
+    await supabase
+      .from('chat_mensagens')
+      .insert([
+        {
+          remetente: sender,
+          mensagem: text,
+          data_envio: new Date()
+        }
+      ])
+  })
+
+  // ================================
+  // ✉️ ENVIO DE MENSAGENS VIA API LOCAL
+  // ================================
+  app.post('/send-message', async (req, res) => {
+    const { number, message } = req.body
+    try {
+      await sock.sendMessage(`${number}@s.whatsapp.net`, { text: message })
+      await supabase
+        .from('chat_mensagens')
+        .insert([{ remetente: 'system', destinatario: number, mensagem: message, data_envio: new Date() }])
+      return res.json({ success: true, message: 'Mensagem enviada!' })
+    } catch (error) {
+      console.error(error)
+      return res.status(500).json({ success: false, error: error.message })
+    }
+  })
+
+  sock.ev.on('creds.update', saveCreds)
 }
 
-// ==================== Inicializa conexão ====================
-startSock();
-
-// ==================== ENDPOINTS ====================
-
-// ---------- STATUS ----------
-app.get("/status", (req, res) => {
-  const isConnected = sock?.user ? true : false;
-  const number = sock?.user?.id ? sock.user.id.split(":")[0] : null;
-
-  res.json({
-    status: "online",
-    mensagem: "Servidor rodando e pronto para integração com Lovable!",
-    conectado: isConnected,
-    number,
-  });
-});
-
-// ---------- ENVIO DE MENSAGEM ----------
-app.post("/send", async (req, res) => {
-  try {
-    const to = req.body.to || req.body.number || req.body.telefone;
-    const text = req.body.text || req.body.message || req.body.mensagem;
-
-    if (!to || !text) {
-      return res.status(400).json({
-        status: "error",
-        message:
-          "Campos inválidos. Envie { to/text } ou { number/message } no corpo da requisição.",
-      });
-    }
-
-    const cleanNumber = to.replace(/\D/g, "");
-    const jid = cleanNumber.includes("@s.whatsapp.net")
-      ? cleanNumber
-      : `${cleanNumber}@s.whatsapp.net`;
-
-    await sock.sendMessage(jid, { text });
-    console.log("📤 Mensagem enviada com sucesso para:", jid);
-
-    res.json({ status: "ok", para: jid, mensagem: text });
-  } catch (error) {
-    console.error("❌ Erro ao enviar mensagem:", error);
-    res.status(500).json({ status: "error", message: error.message });
-  }
-});
-
-// ---------- LOGOUT ----------
-app.get("/logout", async (req, res) => {
-  try {
-    await sock.logout();
-    res.json({ status: "ok", message: "Sessão encerrada com sucesso." });
-  } catch (error) {
-    res.status(500).json({ status: "error", message: error.message });
-  }
-});
-
-// ---------- START SERVER ----------
+// ================================
+// 🚀 INICIALIZA SERVIDOR E BAILEYS
+// ================================
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor rodando na porta ${PORT}`);
-});
+  console.log(`🌐 Servidor Baileys rodando na porta ${PORT}`)
+  connectToWhatsApp()
+})
