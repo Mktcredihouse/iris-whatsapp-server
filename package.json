@@ -1,19 +1,30 @@
 {
   "name": "iris-whatsapp-server",
   "version": "1.0.0",
-  "description": "Servidor WhatsApp (Baileys) com /qr e /send",
-  "type": "module",
+  "description": "Servidor WhatsApp Web com Baileys e integração Lovable CRM",
   "main": "index.js",
+  "type": "module",
   "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=20.0.0"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.20",
+    "@whiskeysockets/baileys": "^6.6.0",
     "express": "^4.19.2",
-    "pino": "^9.3.2",
-    "qrcode": "^1.5.3"
-  }
+    "node-fetch": "^3.3.2",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "express",
+    "lovable",
+    "crm",
+    "api"
+  ],
+  "author": "Credlar Construtora",
+  "license": "MIT"
 }
