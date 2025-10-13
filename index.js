@@ -16,8 +16,6 @@ import fetch from 'node-fetch'
 const PORT = process.env.PORT || 3000
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNzYnV3cGVhc2JreG9ib3dmeXZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NzA4MjEsImV4cCI6MjA3NTQ0NjgyMX0.plDzeNZQZEv8-3OX09VSTAUURq01zLm0PXxc2KdPAuY"
-
-// (Opcional) URL do webhook IRIS (se quiser enviar as mensagens para outra API)
 const WEBHOOK_URL = process.env.WEBHOOK_URL || null
 
 // Inicializa Supabase
@@ -26,6 +24,13 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 // Inicializa Express
 const app = express()
 app.use(express.json())
+
+// Variável global para status da conexão
+let whatsappStatus = {
+  connected: false,
+  lastConnection: null,
+  lastMessage: null
+}
 
 // ================================
 // 🔐 INICIALIZAÇÃO DO BAILEYS
@@ -56,6 +61,7 @@ async function connectToWhatsApp() {
 
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
+      whatsappStatus.connected = false
       if (reason === DisconnectReason.loggedOut) {
         console.log('❌ Sessão encerrada. Apague a pasta "session" e reconecte.')
       } else {
@@ -66,6 +72,9 @@ async function connectToWhatsApp() {
 
     if (connection === 'open') {
       console.log('✅ WhatsApp conectado com sucesso!')
+      whatsappStatus.connected = true
+      whatsappStatus.lastConnection = new Date()
+
       await supabase
         .from('whatsapp_connection')
         .insert([{ status: 'connected', updated_at: new Date() }])
@@ -84,9 +93,10 @@ async function connectToWhatsApp() {
     const timestamp = new Date()
 
     console.log(`📩 Mensagem recebida de ${sender}: ${text}`)
+    whatsappStatus.lastMessage = { sender, text, timestamp }
 
     try {
-      // Salva no Supabase (Lovable)
+      // Salva no Supabase
       await supabase
         .from('chat_mensagens')
         .insert([
@@ -122,7 +132,6 @@ async function connectToWhatsApp() {
     try {
       await sock.sendMessage(`${number}@s.whatsapp.net`, { text: message })
 
-      // Registra no Supabase
       await supabase
         .from('chat_mensagens')
         .insert([
@@ -138,6 +147,24 @@ async function connectToWhatsApp() {
     } catch (error) {
       console.error('❌ Erro ao enviar mensagem:', error)
       return res.status(500).json({ success: false, error: error.message })
+    }
+  })
+
+  // ================================
+  // 📡 ROTA DE STATUS DO SERVIDOR
+  // ================================
+  app.get('/status', async (req, res) => {
+    try {
+      const { data: dbStatus } = await supabase.from('whatsapp_connection').select('*').limit(1).order('updated_at', { ascending: false })
+      res.json({
+        whatsapp: whatsappStatus.connected ? '🟢 Conectado' : '🔴 Desconectado',
+        ultima_conexao: whatsappStatus.lastConnection,
+        ultima_mensagem: whatsappStatus.lastMessage,
+        banco: dbStatus && dbStatus.length > 0 ? dbStatus[0].status : 'indefinido',
+        timestamp: new Date()
+      })
+    } catch (error) {
+      res.status(500).json({ error: 'Erro ao consultar status', details: error.message })
     }
   })
 
