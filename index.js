@@ -8,6 +8,7 @@ import P from 'pino'
 import express from 'express'
 import qrcode from 'qrcode-terminal'
 import { Boom } from '@hapi/boom'
+import fetch from 'node-fetch'
 
 // ================================
 // 🔧 CONFIGURAÇÕES GERAIS
@@ -56,7 +57,7 @@ async function connectToWhatsApp() {
 
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
-      console.log('⚠️ Conexão fechada:', reason)
+      console.log('⚠️ Conexão encerrada:', reason)
       connectionStatus.connected = false
       connectionStatus.number = null
 
@@ -81,6 +82,9 @@ async function connectToWhatsApp() {
     }
   })
 
+  // ================================
+  // 💬 RECEBIMENTO DE MENSAGENS
+  // ================================
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0]
     if (!msg.message) return
@@ -90,6 +94,7 @@ async function connectToWhatsApp() {
 
     console.log(`📩 Mensagem recebida de ${sender}: ${text}`)
 
+    // 1️⃣ Salva no Supabase (Lovable Cloud)
     await supabase
       .from('chat_mensagens')
       .insert([
@@ -99,6 +104,29 @@ async function connectToWhatsApp() {
           data_envio: new Date()
         }
       ])
+
+    // 2️⃣ Envia webhook para Lovable (notificação em tempo real)
+    try {
+      await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/whatsapp-webhook", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "apikey": SUPABASE_ANON_KEY,
+          "Authorization": `Bearer ${SUPABASE_ANON_KEY}`
+        },
+        body: JSON.stringify({
+          type: "message_received",
+          data: {
+            remetente: sender,
+            mensagem: text,
+            data_envio: new Date().toISOString()
+          }
+        })
+      })
+      console.log("📨 Webhook Lovable notificado com sucesso!")
+    } catch (err) {
+      console.error("⚠️ Falha ao notificar o Lovable:", err.message)
+    }
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -129,7 +157,6 @@ app.post('/send-message', async (req, res) => {
     console.log('Número:', number)
     console.log('Mensagem:', message)
 
-    // Validação básica
     if (!number || !message) {
       console.error('❌ Requisição inválida: falta número ou mensagem.')
       return res.status(400).json({ success: false, error: 'Número e mensagem são obrigatórios.' })
@@ -140,10 +167,7 @@ app.post('/send-message', async (req, res) => {
       return res.status(503).json({ success: false, error: 'Servidor WhatsApp não conectado.' })
     }
 
-    // Corrige o formato do número
     const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
-
-    // Envia a mensagem
     const sentMsg = await sock.sendMessage(jid, { text: message })
 
     console.log('✅ Mensagem enviada com sucesso:', sentMsg.key.id)
@@ -170,6 +194,24 @@ app.post('/send-message', async (req, res) => {
       success: false,
       error: error.message || 'Erro interno ao enviar mensagem.'
     })
+  }
+})
+
+// ================================
+// 🚪 ENDPOINT: LOGOUT (desconectar via painel IRIS)
+// ================================
+app.get('/logout', async (req, res) => {
+  try {
+    if (sock) {
+      await sock.logout()
+      connectionStatus.connected = false
+      console.log('🚪 Sessão encerrada manualmente.')
+      return res.json({ success: true, message: 'Sessão encerrada com sucesso.' })
+    }
+    return res.status(400).json({ success: false, message: 'Nenhuma sessão ativa encontrada.' })
+  } catch (err) {
+    console.error('❌ Erro ao desconectar:', err)
+    return res.status(500).json({ success: false, error: err.message })
   }
 })
 
