@@ -11,7 +11,7 @@ import qrcode from 'qrcode-terminal'
 // ================================
 // 🔧 CONFIGURAÇÕES GERAIS
 // ================================
-const PORT = process.env.PORT || 3000
+const PORT = process.env.PORT || 10000  // Alterado para 10000
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNzYnV3cGVhc2JreG9ib3dmeXZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NzA4MjEsImV4cCI6MjA3NTQ0NjgyMX0.plDzeNZQZEv8-3OX09VSTAUURq01zLm0PXxc2KdPAuY"
 
@@ -73,14 +73,9 @@ async function connectToWhatsApp() {
     const msg = messages[0]
     if (!msg.message) return
 
-    // Garantir que o número recebido esteja no formato correto
-    let sender = msg.key.remoteJid
-    if (sender.includes('@lid')) {
-      // Converter para o formato de número real (com @s.whatsapp.net)
-      sender = sender.replace('@lid', '@s.whatsapp.net')
-    }
-
+    const sender = msg.key.remoteJid
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text
+
     console.log(`📩 Mensagem recebida de ${sender}: ${text}`)
 
     // Salva no banco de dados Lovable (Supabase)
@@ -100,12 +95,8 @@ async function connectToWhatsApp() {
   // ================================
   app.post('/send-message', async (req, res) => {
     const { number, message } = req.body
-
-    // Corrigir formato do número para o padrão do Baileys
-    const formattedNumber = `${number}@s.whatsapp.net`
-
     try {
-      await sock.sendMessage(formattedNumber, { text: message })
+      await sock.sendMessage(`${number}@s.whatsapp.net`, { text: message })
       await supabase
         .from('chat_mensagens')
         .insert([{ remetente: 'system', destinatario: number, mensagem: message, data_envio: new Date() }])
