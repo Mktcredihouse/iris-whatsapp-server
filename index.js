@@ -19,10 +19,11 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIs
 // Inicializa Supabase
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-// Inicializa Express para webhook ou endpoints locais
+// Inicializa Express
 const app = express()
 app.use(express.json())
 
+let sock = null
 let connectionStatus = {
   connected: false,
   number: null,
@@ -36,7 +37,7 @@ async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('./session')
   const { version } = await fetchLatestBaileysVersion()
   
-  const sock = makeWASocket({
+  sock = makeWASocket({
     version,
     printQRInTerminal: true,
     auth: state,
@@ -44,9 +45,6 @@ async function connectToWhatsApp() {
     browser: ['Iris CRM', 'Chrome', '4.0']
   })
 
-  // ================================
-  // 📲 QR CODE GERADO
-  // ================================
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
 
@@ -58,12 +56,12 @@ async function connectToWhatsApp() {
 
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
-      if (reason === DisconnectReason.loggedOut) {
-        console.log('❌ Sessão encerrada. Apague a pasta "session" e reconecte.')
-        connectionStatus.connected = false
-        connectionStatus.number = null
-      } else {
-        console.log('🔄 Reconectando...')
+      console.log('⚠️ Conexão fechada:', reason)
+      connectionStatus.connected = false
+      connectionStatus.number = null
+
+      if (reason !== DisconnectReason.loggedOut) {
+        console.log('🔄 Tentando reconectar...')
         connectToWhatsApp()
       }
     }
@@ -83,9 +81,6 @@ async function connectToWhatsApp() {
     }
   })
 
-  // ================================
-  // 💬 RECEBIMENTO DE MENSAGENS
-  // ================================
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0]
     if (!msg.message) return
@@ -95,7 +90,6 @@ async function connectToWhatsApp() {
 
     console.log(`📩 Mensagem recebida de ${sender}: ${text}`)
 
-    // Salva no banco de dados Lovable (Supabase)
     await supabase
       .from('chat_mensagens')
       .insert([
@@ -107,32 +101,15 @@ async function connectToWhatsApp() {
       ])
   })
 
-  // ================================
-  // ✉️ ENVIO DE MENSAGENS VIA API LOCAL
-  // ================================
-  app.post('/send-message', async (req, res) => {
-    const { number, message } = req.body
-    try {
-      await sock.sendMessage(`${number}@s.whatsapp.net`, { text: message })
-      await supabase
-        .from('chat_mensagens')
-        .insert([{ remetente: 'system', destinatario: number, mensagem: message, data_envio: new Date() }])
-      return res.json({ success: true, message: 'Mensagem enviada!' })
-    } catch (error) {
-      console.error(error)
-      return res.status(500).json({ success: false, error: error.message })
-    }
-  })
-
   sock.ev.on('creds.update', saveCreds)
 }
 
 // ================================
-// 🩵 ENDPOINT /STATUS (USADO PELO IRIS CRM)
+// 📡 ENDPOINT: STATUS
 // ================================
 app.get('/status', async (req, res) => {
   const { connected, number, lastUpdate } = connectionStatus
-  return res.json({
+  res.json({
     success: true,
     connected,
     number,
@@ -142,7 +119,62 @@ app.get('/status', async (req, res) => {
 })
 
 // ================================
-// 🚀 INICIALIZA SERVIDOR E BAILEYS
+// ✉️ ENDPOINT: SEND-MESSAGE
+// ================================
+app.post('/send-message', async (req, res) => {
+  try {
+    const { number, message } = req.body
+
+    console.log('📤 Requisição recebida do Lovable:')
+    console.log('Número:', number)
+    console.log('Mensagem:', message)
+
+    // Validação básica
+    if (!number || !message) {
+      console.error('❌ Requisição inválida: falta número ou mensagem.')
+      return res.status(400).json({ success: false, error: 'Número e mensagem são obrigatórios.' })
+    }
+
+    if (!sock || !connectionStatus.connected) {
+      console.error('❌ Baileys não conectado.')
+      return res.status(503).json({ success: false, error: 'Servidor WhatsApp não conectado.' })
+    }
+
+    // Corrige o formato do número
+    const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
+
+    // Envia a mensagem
+    const sentMsg = await sock.sendMessage(jid, { text: message })
+
+    console.log('✅ Mensagem enviada com sucesso:', sentMsg.key.id)
+
+    await supabase
+      .from('chat_mensagens')
+      .insert([
+        {
+          remetente: connectionStatus.number,
+          destinatario: number,
+          mensagem: message,
+          data_envio: new Date()
+        }
+      ])
+
+    return res.json({
+      success: true,
+      message: 'Mensagem enviada com sucesso.',
+      waId: sentMsg.key.id
+    })
+  } catch (error) {
+    console.error('❌ Erro ao enviar mensagem:', error)
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Erro interno ao enviar mensagem.'
+    })
+  }
+})
+
+// ================================
+// 🚀 INICIA SERVIDOR
 // ================================
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Servidor rodando na porta ${PORT}`)
