@@ -1,7 +1,8 @@
 import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  DisconnectReason
+  DisconnectReason,
+  downloadMediaMessage
 } from '@whiskeysockets/baileys'
 import { createClient } from '@supabase/supabase-js'
 import P from 'pino'
@@ -17,10 +18,7 @@ const PORT = process.env.PORT || 10000
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNzYnV3cGVhc2JreG9ib3dmeXZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NzA4MjEsImV4cCI6MjA3NTQ0NjgyMX0.plDzeNZQZEv8-3OX09VSTAUURq01zLm0PXxc2KdPAuY"
 
-// Inicializa Supabase
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
-
-// Inicializa Express
 const app = express()
 app.use(express.json())
 
@@ -32,18 +30,18 @@ let connectionStatus = {
 }
 
 // ================================
-// 🔐 INICIALIZAÇÃO DO BAILEYS
+// 🔐 CONEXÃO COM WHATSAPP
 // ================================
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('./session')
   const { version } = await fetchLatestBaileysVersion()
-  
+
   sock = makeWASocket({
     version,
     printQRInTerminal: true,
     auth: state,
     logger: P({ level: 'silent' }),
-    browser: ['Iris CRM', 'Chrome', '4.0']
+    browser: ['IRIS CRM', 'Chrome', '4.0']
   })
 
   sock.ev.on('connection.update', async (update) => {
@@ -60,7 +58,6 @@ async function connectToWhatsApp() {
       console.log('⚠️ Conexão encerrada:', reason)
       connectionStatus.connected = false
       connectionStatus.number = null
-
       if (reason !== DisconnectReason.loggedOut) {
         console.log('🔄 Tentando reconectar...')
         connectToWhatsApp()
@@ -75,63 +72,77 @@ async function connectToWhatsApp() {
         number: user,
         lastUpdate: new Date().toISOString()
       }
-
-      await supabase
-        .from('whatsapp_connection')
-        .insert([{ status: 'connected', numero: user, updated_at: new Date() }])
     }
   })
 
   // ================================
-  // 💬 RECEBIMENTO DE MENSAGENS
+  // 💬 RECEBIMENTO DE MENSAGENS (TEXTO + MÍDIA)
   // ================================
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0]
     if (!msg.message) return
 
     const sender = msg.key.remoteJid
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
     const pushName = msg.pushName || 'Cliente'
+    let content = ''
+    let type = 'text'
+    let mediaBase64 = null
 
-    console.log(`📩 Mensagem recebida de ${sender}: ${text}`)
-
-    // 1️⃣ Salva no Supabase (opcional)
-    await supabase
-      .from('chat_mensagens')
-      .insert([
-        {
-          remetente: sender,
-          mensagem: text,
-          data_envio: new Date()
-        }
-      ])
-
-    // 2️⃣ Envia webhook para Lovable
     try {
-      const webhookUrl = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook"
-      const payload = {
-        from: sender,
-        message: text,
-        name: pushName
+      // Tipo da mensagem
+      if (msg.message.conversation) {
+        content = msg.message.conversation
+      } else if (msg.message.extendedTextMessage) {
+        content = msg.message.extendedTextMessage.text
+      } else if (msg.message.imageMessage) {
+        type = 'image'
+        content = msg.message.imageMessage.caption || ''
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
+        mediaBase64 = `data:${msg.message.imageMessage.mimetype};base64,${buffer.toString('base64')}`
+      } else if (msg.message.audioMessage) {
+        type = 'audio'
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
+        mediaBase64 = `data:${msg.message.audioMessage.mimetype};base64,${buffer.toString('base64')}`
+      } else if (msg.message.videoMessage) {
+        type = 'video'
+        content = msg.message.videoMessage.caption || ''
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
+        mediaBase64 = `data:${msg.message.videoMessage.mimetype};base64,${buffer.toString('base64')}`
+      } else if (msg.message.documentMessage) {
+        type = 'document'
+        content = msg.message.documentMessage.fileName || 'Arquivo recebido'
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
+        mediaBase64 = `data:${msg.message.documentMessage.mimetype};base64,${buffer.toString('base64')}`
       }
 
-      const response = await fetch(webhookUrl, {
+      console.log(`📩 Mensagem (${type}) recebida de ${sender}: ${content}`)
+
+      // Salva no Supabase
+      await supabase.from('chat_mensagens').insert([
+        { remetente: sender, mensagem: content, tipo: type, data_envio: new Date() }
+      ])
+
+      // Envia para Lovable Webhook
+      const response = await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "apikey": SUPABASE_ANON_KEY,
           "Authorization": `Bearer ${SUPABASE_ANON_KEY}`
         },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({
+          from: sender,
+          message: content,
+          name: pushName,
+          type,
+          media: mediaBase64
+        })
       })
 
-      if (response.ok) {
-        console.log("📨 Mensagem enviada com sucesso para webhook Lovable.")
-      } else {
-        console.error(`⚠️ Erro ao enviar para webhook Lovable: ${response.status}`)
-      }
+      if (response.ok) console.log("📨 Webhook Lovable notificado com sucesso.")
+      else console.error(`⚠️ Webhook Lovable respondeu: ${response.status}`)
     } catch (err) {
-      console.error("❌ Falha ao chamar webhook Lovable:", err.message)
+      console.error("❌ Erro no recebimento:", err.message)
     }
   })
 
@@ -139,78 +150,82 @@ async function connectToWhatsApp() {
 }
 
 // ================================
-// 📡 ENDPOINT: STATUS
+// 📡 ENDPOINT STATUS
 // ================================
-app.get('/status', async (req, res) => {
-  const { connected, number, lastUpdate } = connectionStatus
+app.get('/status', (req, res) => {
   res.json({
     success: true,
-    connected,
-    number,
-    lastUpdate,
+    connected: connectionStatus.connected,
+    number: connectionStatus.number,
+    lastUpdate: connectionStatus.lastUpdate,
     timestamp: new Date().toISOString()
   })
 })
 
 // ================================
-// ✉️ ENDPOINT: SEND-MESSAGE (usado pelo Lovable)
+// ✉️ ENDPOINT ENVIO DE MENSAGEM/MÍDIA
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
-    const { number, message } = req.body // <- Campos esperados pelo Lovable
-
-    console.log('📤 Requisição recebida do Lovable:')
-    console.log('Número:', number)
-    console.log('Mensagem:', message)
-
-    if (!number || !message) {
-      console.error('❌ Requisição inválida: falta número ou mensagem.')
-      return res.status(400).json({ success: false, error: 'Número e mensagem são obrigatórios.' })
-    }
-
-    if (!sock || !connectionStatus.connected) {
-      console.error('❌ Baileys não conectado.')
-      return res.status(503).json({ success: false, error: 'Servidor WhatsApp não conectado.' })
-    }
+    const { number, message, type, media } = req.body
+    if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
 
     const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
-    const sentMsg = await sock.sendMessage(jid, { text: message })
+    let sentMsg = null
 
-    console.log('✅ Mensagem enviada com sucesso:', sentMsg.key.id)
+    console.log(`📤 Enviando mensagem para ${jid}: ${message || '(mídia)'}`)
 
-    await supabase
-      .from('chat_mensagens')
-      .insert([
-        {
-          remetente: connectionStatus.number,
-          destinatario: number,
-          mensagem: message,
-          data_envio: new Date()
-        }
-      ])
+    // Se for mídia
+    if (media && type) {
+      const mediaBuffer = Buffer.from(media.split(',')[1], 'base64')
 
-    return res.json({
-      success: true,
-      message: 'Mensagem enviada com sucesso.',
-      waId: sentMsg.key.id
-    })
+      if (type === 'image') {
+        sentMsg = await sock.sendMessage(jid, { image: mediaBuffer, caption: message || '' })
+      } else if (type === 'audio') {
+        sentMsg = await sock.sendMessage(jid, { audio: mediaBuffer, mimetype: 'audio/mp4', ptt: true })
+      } else if (type === 'video') {
+        sentMsg = await sock.sendMessage(jid, { video: mediaBuffer, caption: message || '' })
+      } else if (type === 'document') {
+        sentMsg = await sock.sendMessage(jid, {
+          document: mediaBuffer,
+          mimetype: 'application/pdf',
+          fileName: message || 'arquivo.pdf'
+        })
+      } else {
+        sentMsg = await sock.sendMessage(jid, { text: message })
+      }
+    } else {
+      // Texto simples
+      sentMsg = await sock.sendMessage(jid, { text: message })
+    }
+
+    console.log('✅ Mensagem enviada com sucesso.')
+
+    await supabase.from('chat_mensagens').insert([
+      {
+        remetente: connectionStatus.number,
+        destinatario: number,
+        mensagem: message || '(mídia)',
+        tipo: type || 'text',
+        data_envio: new Date()
+      }
+    ])
+
+    res.json({ success: true, message: 'Mensagem enviada com sucesso.' })
   } catch (error) {
     console.error('❌ Erro ao enviar mensagem:', error)
-    return res.status(500).json({
-      success: false,
-      error: error.message || 'Erro interno ao enviar mensagem.'
-    })
+    res.status(500).json({ success: false, error: error.message })
   }
 })
 
-// Alias para /send (caso Lovable ainda use o endpoint antigo)
+// Compatibilidade com endpoint antigo /send
 app.post('/send', async (req, res) => {
   req.url = '/send-message'
   app._router.handle(req, res)
 })
 
 // ================================
-// 🚪 ENDPOINT: LOGOUT
+// 🚪 ENDPOINT LOGOUT
 // ================================
 app.get('/logout', async (req, res) => {
   try {
@@ -218,17 +233,17 @@ app.get('/logout', async (req, res) => {
       await sock.logout()
       connectionStatus.connected = false
       console.log('🚪 Sessão encerrada manualmente.')
-      return res.json({ success: true, message: 'Sessão encerrada com sucesso.' })
+      return res.json({ success: true, message: 'Sessão encerrada.' })
     }
-    return res.status(400).json({ success: false, message: 'Nenhuma sessão ativa encontrada.' })
+    res.status(400).json({ success: false, message: 'Nenhuma sessão ativa.' })
   } catch (err) {
     console.error('❌ Erro ao desconectar:', err)
-    return res.status(500).json({ success: false, error: err.message })
+    res.status(500).json({ success: false, error: err.message })
   }
 })
 
 // ================================
-// 🚀 INICIA SERVIDOR
+// 🚀 INICIALIZA SERVIDOR
 // ================================
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Servidor rodando na porta ${PORT}`)
