@@ -90,11 +90,12 @@ async function connectToWhatsApp() {
     if (!msg.message) return
 
     const sender = msg.key.remoteJid
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
+    const pushName = msg.pushName || 'Cliente'
 
     console.log(`📩 Mensagem recebida de ${sender}: ${text}`)
 
-    // 1️⃣ Salva no Supabase (Lovable Cloud)
+    // 1️⃣ Salva no Supabase (opcional)
     await supabase
       .from('chat_mensagens')
       .insert([
@@ -105,27 +106,32 @@ async function connectToWhatsApp() {
         }
       ])
 
-    // 2️⃣ Envia webhook para Lovable (notificação em tempo real)
+    // 2️⃣ Envia webhook para Lovable
     try {
-      await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/whatsapp-webhook", {
+      const webhookUrl = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook"
+      const payload = {
+        from: sender,
+        message: text,
+        name: pushName
+      }
+
+      const response = await fetch(webhookUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "apikey": SUPABASE_ANON_KEY,
           "Authorization": `Bearer ${SUPABASE_ANON_KEY}`
         },
-        body: JSON.stringify({
-          type: "message_received",
-          data: {
-            remetente: sender,
-            mensagem: text,
-            data_envio: new Date().toISOString()
-          }
-        })
+        body: JSON.stringify(payload)
       })
-      console.log("📨 Webhook Lovable notificado com sucesso!")
+
+      if (response.ok) {
+        console.log("📨 Mensagem enviada com sucesso para webhook Lovable.")
+      } else {
+        console.error(`⚠️ Erro ao enviar para webhook Lovable: ${response.status}`)
+      }
     } catch (err) {
-      console.error("⚠️ Falha ao notificar o Lovable:", err.message)
+      console.error("❌ Falha ao chamar webhook Lovable:", err.message)
     }
   })
 
@@ -147,11 +153,11 @@ app.get('/status', async (req, res) => {
 })
 
 // ================================
-// ✉️ ENDPOINT: SEND-MESSAGE
+// ✉️ ENDPOINT: SEND-MESSAGE (usado pelo Lovable)
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
-    const { number, message } = req.body
+    const { number, message } = req.body // <- Campos esperados pelo Lovable
 
     console.log('📤 Requisição recebida do Lovable:')
     console.log('Número:', number)
@@ -197,8 +203,14 @@ app.post('/send-message', async (req, res) => {
   }
 })
 
+// Alias para /send (caso Lovable ainda use o endpoint antigo)
+app.post('/send', async (req, res) => {
+  req.url = '/send-message'
+  app._router.handle(req, res)
+})
+
 // ================================
-// 🚪 ENDPOINT: LOGOUT (desconectar via painel IRIS)
+// 🚪 ENDPOINT: LOGOUT
 // ================================
 app.get('/logout', async (req, res) => {
   try {
