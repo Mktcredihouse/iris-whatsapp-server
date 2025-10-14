@@ -16,8 +16,10 @@ import os from 'os'
 // 🔧 CONFIGURAÇÕES GERAIS
 // ================================
 const PORT = process.env.PORT || 10000
-const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNzYnV3cGVhc2JreG9ib3dmeXZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NzA4MjEsImV4cCI6MjA3NTQ0NjgyMX0.plDzeNZQZEv8-3OX09VSTAUURq01zLm0PXxc2KdPAuY"
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://ssbuwpeasbkxobowfyvw.supabase.co'
+const SUPABASE_ANON_KEY =
+  process.env.SUPABASE_ANON_KEY ||
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNzYnV3cGVhc2JreG9ib3dmeXZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NzA4MjEsImV4cCI6MjA3NTQ0NjgyMX0.plDzeNZQZEv8-3OX09VSTAUURq01zLm0PXxc2KdPAuY'
 
 // ================================
 // 🔌 SUPABASE + EXPRESS
@@ -26,7 +28,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 const app = express()
 app.use(express.json())
 
-// CORS simples para permitir chamadas da Edge Function sem dor de cabeça
+// CORS simples para chamadas da Edge Function / browser
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
@@ -47,7 +49,7 @@ let connectionStatus = {
 }
 
 // ================================
-/* 🔐 CONEXÃO COM WHATSAPP */
+// 🔐 CONEXÃO COM WHATSAPP
 // ================================
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('./session')
@@ -134,26 +136,20 @@ async function connectToWhatsApp() {
 
       console.log(`📩 Mensagem (${type}) recebida de ${sender}: ${content}`)
 
-      // Salva no Supabase (tabela livre de PII sensível)
+      // Salva no Supabase (registro básico)
       await supabase.from('chat_mensagens').insert([
         { remetente: sender, mensagem: content || '(mídia)', tipo: type, data_envio: new Date() }
       ])
 
-      // Notifica o webhook da Lovable (Edge Function)
+      // Notifica Lovable (Edge Function webhook)
       const response = await fetch(`${SUPABASE_URL}/functions/v1/baileys-webhook`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'apikey': SUPABASE_ANON_KEY,
-          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`
         },
-        body: JSON.stringify({
-          from: sender,
-          message: content,
-          name: pushName,
-          type,
-          media: mediaBase64
-        })
+        body: JSON.stringify({ from: sender, message: content, name: pushName, type, media: mediaBase64 })
       })
 
       if (response.ok) console.log('📨 Webhook Lovable notificado com sucesso.')
@@ -167,14 +163,13 @@ async function connectToWhatsApp() {
 }
 
 // ================================
-// 📡 ENDPOINTS DE SAÚDE/STATUS (sem autenticação)
+// 📡 ENDPOINTS DE SAÚDE/STATUS (sem auth)
 // ================================
 app.get('/health', (_req, res) => {
   res.json({ ok: true, uptime_ms: Date.now() - startedAt })
 })
 
 app.get('/status', (_req, res) => {
-  // resposta simples e estável para a Edge Function
   res.json({
     success: true,
     is_connected: !!connectionStatus.connected,
@@ -185,23 +180,24 @@ app.get('/status', (_req, res) => {
       port: Number(PORT),
       uptime_ms: Date.now() - startedAt
     },
-    // campo "version" ajuda debug na ponta
     version: 'iris-whatsapp-server/1.1.0'
   })
 })
 
 // ================================
-// ✉️ ENVIO DE MENSAGEM/MÍDIA
+// ✉️ ENDPOINT ENVIO DE MENSAGEM/MÍDIA
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
     let { number, message, type, media } = req.body
     if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
 
-    // normaliza número (aceita 5511..., 5511...@s.whatsapp.net, etc.)
-    const jid = number.includes('@s.whatsapp.net') ? number : `${String(number).replace(/\D/g,'')}@s.whatsapp.net`
-    let sentMsg = null
+    // normaliza número
+    const jid = number.includes('@s.whatsapp.net')
+      ? number
+      : `${String(number).replace(/\D/g, '')}@s.whatsapp.net`
 
+    let sentMsg = null
     console.log(`📤 Enviando para ${jid}: ${message || '(mídia)'}`)
 
     if (media && type) {
@@ -225,15 +221,15 @@ app.post('/send-message', async (req, res) => {
       sentMsg = await sock.sendMessage(jid, { text: message })
     }
 
-    console.log('✅ Mensagem enviada.')
-
-    await supabase.from('chat_mensagens').insert([{
-      remetente: connectionStatus.number,
-      destinatario: jid,
-      mensagem: message || '(mídia)',
-      tipo: type || 'text',
-      data_envio: new Date()
-    }])
+    await supabase.from('chat_mensagens').insert([
+      {
+        remetente: connectionStatus.number,
+        destinatario: jid,
+        mensagem: message || '(mídia)',
+        tipo: type || 'text',
+        data_envio: new Date()
+      }
+    ])
 
     res.json({ success: true, message: 'Mensagem enviada com sucesso.', id: sentMsg?.key?.id || null })
   } catch (error) {
@@ -242,14 +238,14 @@ app.post('/send-message', async (req, res) => {
   }
 })
 
-// compat com endpoint antigo /send
+// Compat com endpoint antigo /send
 app.post('/send', async (req, res) => {
   req.url = '/send-message'
   app._router.handle(req, res)
 })
 
 // ================================
-// 🚪 LOGOUT
+// 🚪 ENDPOINT LOGOUT
 // ================================
 app.get('/logout', async (_req, res) => {
   try {
@@ -269,9 +265,10 @@ app.get('/logout', async (_req, res) => {
 })
 
 // ================================
-// 🚀 START
+// 🚀 INICIALIZA SERVIDOR
 // ================================
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Servidor rodando na porta ${PORT}`)
   connectToWhatsApp()
 })
+``
