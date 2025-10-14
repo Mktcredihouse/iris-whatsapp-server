@@ -10,6 +10,7 @@ import express from 'express'
 import qrcode from 'qrcode-terminal'
 import { Boom } from '@hapi/boom'
 import fetch from 'node-fetch'
+import os from 'os'
 
 // ================================
 // 🔧 CONFIGURAÇÕES GERAIS
@@ -18,11 +19,27 @@ const PORT = process.env.PORT || 10000
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNzYnV3cGVhc2JreG9ib3dmeXZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NzA4MjEsImV4cCI6MjA3NTQ0NjgyMX0.plDzeNZQZEv8-3OX09VSTAUURq01zLm0PXxc2KdPAuY"
 
+// ================================
+// 🔌 SUPABASE + EXPRESS
+// ================================
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 const app = express()
 app.use(express.json())
 
+// CORS simples para permitir chamadas da Edge Function sem dor de cabeça
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey')
+  if (req.method === 'OPTIONS') return res.status(204).end()
+  next()
+})
+
+// ================================
+// 🔐 ESTADO GLOBAL
+// ================================
 let sock = null
+const startedAt = Date.now()
 let connectionStatus = {
   connected: false,
   number: null,
@@ -30,7 +47,7 @@ let connectionStatus = {
 }
 
 // ================================
-// 🔐 CONEXÃO COM WHATSAPP
+/* 🔐 CONEXÃO COM WHATSAPP */
 // ================================
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('./session')
@@ -58,6 +75,7 @@ async function connectToWhatsApp() {
       console.log('⚠️ Conexão encerrada:', reason)
       connectionStatus.connected = false
       connectionStatus.number = null
+      connectionStatus.lastUpdate = new Date().toISOString()
       if (reason !== DisconnectReason.loggedOut) {
         console.log('🔄 Tentando reconectar...')
         connectToWhatsApp()
@@ -79,8 +97,8 @@ async function connectToWhatsApp() {
   // 💬 RECEBIMENTO DE MENSAGENS (TEXTO + MÍDIA)
   // ================================
   sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0]
-    if (!msg.message) return
+    const msg = messages?.[0]
+    if (!msg || !msg.message) return
 
     const sender = msg.key.remoteJid
     const pushName = msg.pushName || 'Cliente'
@@ -89,7 +107,6 @@ async function connectToWhatsApp() {
     let mediaBase64 = null
 
     try {
-      // Tipo da mensagem
       if (msg.message.conversation) {
         content = msg.message.conversation
       } else if (msg.message.extendedTextMessage) {
@@ -117,18 +134,18 @@ async function connectToWhatsApp() {
 
       console.log(`📩 Mensagem (${type}) recebida de ${sender}: ${content}`)
 
-      // Salva no Supabase
+      // Salva no Supabase (tabela livre de PII sensível)
       await supabase.from('chat_mensagens').insert([
-        { remetente: sender, mensagem: content, tipo: type, data_envio: new Date() }
+        { remetente: sender, mensagem: content || '(mídia)', tipo: type, data_envio: new Date() }
       ])
 
-      // Envia para Lovable Webhook
-      const response = await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
-        method: "POST",
+      // Notifica o webhook da Lovable (Edge Function)
+      const response = await fetch(`${SUPABASE_URL}/functions/v1/baileys-webhook`, {
+        method: 'POST',
         headers: {
-          "Content-Type": "application/json",
-          "apikey": SUPABASE_ANON_KEY,
-          "Authorization": `Bearer ${SUPABASE_ANON_KEY}`
+          'Content-Type': 'application/json',
+          'apikey': SUPABASE_ANON_KEY,
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
         },
         body: JSON.stringify({
           from: sender,
@@ -139,10 +156,10 @@ async function connectToWhatsApp() {
         })
       })
 
-      if (response.ok) console.log("📨 Webhook Lovable notificado com sucesso.")
+      if (response.ok) console.log('📨 Webhook Lovable notificado com sucesso.')
       else console.error(`⚠️ Webhook Lovable respondeu: ${response.status}`)
     } catch (err) {
-      console.error("❌ Erro no recebimento:", err.message)
+      console.error('❌ Erro no recebimento:', err?.message || err)
     }
   })
 
@@ -150,35 +167,45 @@ async function connectToWhatsApp() {
 }
 
 // ================================
-// 📡 ENDPOINT STATUS
+// 📡 ENDPOINTS DE SAÚDE/STATUS (sem autenticação)
 // ================================
-app.get('/status', (req, res) => {
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, uptime_ms: Date.now() - startedAt })
+})
+
+app.get('/status', (_req, res) => {
+  // resposta simples e estável para a Edge Function
   res.json({
     success: true,
-    connected: connectionStatus.connected,
+    is_connected: !!connectionStatus.connected,
     number: connectionStatus.number,
     lastUpdate: connectionStatus.lastUpdate,
-    timestamp: new Date().toISOString()
+    server: {
+      host: os.hostname(),
+      port: Number(PORT),
+      uptime_ms: Date.now() - startedAt
+    },
+    // campo "version" ajuda debug na ponta
+    version: 'iris-whatsapp-server/1.1.0'
   })
 })
 
 // ================================
-// ✉️ ENDPOINT ENVIO DE MENSAGEM/MÍDIA
+// ✉️ ENVIO DE MENSAGEM/MÍDIA
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
-    const { number, message, type, media } = req.body
+    let { number, message, type, media } = req.body
     if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
 
-    const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
+    // normaliza número (aceita 5511..., 5511...@s.whatsapp.net, etc.)
+    const jid = number.includes('@s.whatsapp.net') ? number : `${String(number).replace(/\D/g,'')}@s.whatsapp.net`
     let sentMsg = null
 
-    console.log(`📤 Enviando mensagem para ${jid}: ${message || '(mídia)'}`)
+    console.log(`📤 Enviando para ${jid}: ${message || '(mídia)'}`)
 
-    // Se for mídia
     if (media && type) {
-      const mediaBuffer = Buffer.from(media.split(',')[1], 'base64')
-
+      const mediaBuffer = Buffer.from(String(media).split(',')?.[1] || '', 'base64')
       if (type === 'image') {
         sentMsg = await sock.sendMessage(jid, { image: mediaBuffer, caption: message || '' })
       } else if (type === 'audio') {
@@ -195,55 +222,54 @@ app.post('/send-message', async (req, res) => {
         sentMsg = await sock.sendMessage(jid, { text: message })
       }
     } else {
-      // Texto simples
       sentMsg = await sock.sendMessage(jid, { text: message })
     }
 
-    console.log('✅ Mensagem enviada com sucesso.')
+    console.log('✅ Mensagem enviada.')
 
-    await supabase.from('chat_mensagens').insert([
-      {
-        remetente: connectionStatus.number,
-        destinatario: number,
-        mensagem: message || '(mídia)',
-        tipo: type || 'text',
-        data_envio: new Date()
-      }
-    ])
+    await supabase.from('chat_mensagens').insert([{
+      remetente: connectionStatus.number,
+      destinatario: jid,
+      mensagem: message || '(mídia)',
+      tipo: type || 'text',
+      data_envio: new Date()
+    }])
 
-    res.json({ success: true, message: 'Mensagem enviada com sucesso.' })
+    res.json({ success: true, message: 'Mensagem enviada com sucesso.', id: sentMsg?.key?.id || null })
   } catch (error) {
-    console.error('❌ Erro ao enviar mensagem:', error)
-    res.status(500).json({ success: false, error: error.message })
+    console.error('❌ Erro ao enviar mensagem:', error?.message || error)
+    res.status(500).json({ success: false, error: String(error?.message || error) })
   }
 })
 
-// Compatibilidade com endpoint antigo /send
+// compat com endpoint antigo /send
 app.post('/send', async (req, res) => {
   req.url = '/send-message'
   app._router.handle(req, res)
 })
 
 // ================================
-// 🚪 ENDPOINT LOGOUT
+// 🚪 LOGOUT
 // ================================
-app.get('/logout', async (req, res) => {
+app.get('/logout', async (_req, res) => {
   try {
     if (sock) {
       await sock.logout()
       connectionStatus.connected = false
+      connectionStatus.number = null
+      connectionStatus.lastUpdate = new Date().toISOString()
       console.log('🚪 Sessão encerrada manualmente.')
       return res.json({ success: true, message: 'Sessão encerrada.' })
     }
     res.status(400).json({ success: false, message: 'Nenhuma sessão ativa.' })
   } catch (err) {
-    console.error('❌ Erro ao desconectar:', err)
-    res.status(500).json({ success: false, error: err.message })
+    console.error('❌ Erro ao desconectar:', err?.message || err)
+    res.status(500).json({ success: false, error: String(err?.message || err) })
   }
 })
 
 // ================================
-// 🚀 INICIALIZA SERVIDOR
+// 🚀 START
 // ================================
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Servidor rodando na porta ${PORT}`)
