@@ -28,7 +28,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 const app = express()
 app.use(express.json())
 
-// CORS simples para chamadas da Edge Function / browser
+// CORS simples (Edge/Browser)
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
@@ -136,12 +136,10 @@ async function connectToWhatsApp() {
 
       console.log(`📩 Mensagem (${type}) recebida de ${sender}: ${content}`)
 
-      // Salva no Supabase (registro básico)
       await supabase.from('chat_mensagens').insert([
         { remetente: sender, mensagem: content || '(mídia)', tipo: type, data_envio: new Date() }
       ])
 
-      // Notifica Lovable (Edge Function webhook)
       const response = await fetch(`${SUPABASE_URL}/functions/v1/baileys-webhook`, {
         method: 'POST',
         headers: {
@@ -175,11 +173,7 @@ app.get('/status', (_req, res) => {
     is_connected: !!connectionStatus.connected,
     number: connectionStatus.number,
     lastUpdate: connectionStatus.lastUpdate,
-    server: {
-      host: os.hostname(),
-      port: Number(PORT),
-      uptime_ms: Date.now() - startedAt
-    },
+    server: { host: os.hostname(), port: Number(PORT), uptime_ms: Date.now() - startedAt },
     version: 'iris-whatsapp-server/1.1.0'
   })
 })
@@ -192,7 +186,6 @@ app.post('/send-message', async (req, res) => {
     let { number, message, type, media } = req.body
     if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
 
-    // normaliza número
     const jid = number.includes('@s.whatsapp.net')
       ? number
       : `${String(number).replace(/\D/g, '')}@s.whatsapp.net`
@@ -221,15 +214,13 @@ app.post('/send-message', async (req, res) => {
       sentMsg = await sock.sendMessage(jid, { text: message })
     }
 
-    await supabase.from('chat_mensagens').insert([
-      {
-        remetente: connectionStatus.number,
-        destinatario: jid,
-        mensagem: message || '(mídia)',
-        tipo: type || 'text',
-        data_envio: new Date()
-      }
-    ])
+    await supabase.from('chat_mensagens').insert([{
+      remetente: connectionStatus.number,
+      destinatario: jid,
+      mensagem: message || '(mídia)',
+      tipo: type || 'text',
+      data_envio: new Date()
+    }])
 
     res.json({ success: true, message: 'Mensagem enviada com sucesso.', id: sentMsg?.key?.id || null })
   } catch (error) {
@@ -271,4 +262,3 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Servidor rodando na porta ${PORT}`)
   connectToWhatsApp()
 })
-``
