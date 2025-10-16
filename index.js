@@ -11,19 +11,17 @@ import qrcode from 'qrcode-terminal'
 import { Boom } from '@hapi/boom'
 import fetch from 'node-fetch'
 import dotenv from 'dotenv'
+
 dotenv.config()
 
 // ================================
 // 🔧 CONFIGURAÇÕES GERAIS
 // ================================
 const PORT = process.env.PORT || 10000
-const EMPRESA_ID = process.env.EMPRESA_ID || 'credihouse'
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://ssbuwpeasbkxobowfyvw.supabase.co'
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY ||
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNzYnV3cGVhc2JreG9ib3dmeXZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NzA4MjEsImV4cCI6MjA3NTQ0NjgyMX0.plDzeNZQZEv8-3OX09VSTAUURq01zLm0PXxc2KdPAuY'
-
-const WEBHOOK_URL = `${SUPABASE_URL}/functions/v1/baileys-webhook`
-const WEBHOOK_SECRET = process.env.BAILEYS_WEBHOOK_SECRET || 'credlar-shared-secret'
+const EMPRESA_ID = process.env.EMPRESA_ID || 'empresa-desconhecida'
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+const BAILEYS_WEBHOOK_SECRET = process.env.BAILEYS_WEBHOOK_SECRET || "credlar-shared-secret"
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 const app = express()
@@ -33,8 +31,7 @@ let sock = null
 let connectionStatus = {
   connected: false,
   number: null,
-  lastUpdate: null,
-  empresa_id: EMPRESA_ID
+  lastUpdate: null
 }
 
 // ================================
@@ -57,7 +54,7 @@ async function connectToWhatsApp() {
 
     if (qr) {
       console.clear()
-      console.log(`📱 [${EMPRESA_ID}] Escaneie o QR Code:`)
+      console.log(`📱 [${EMPRESA_ID}] Escaneie o QR Code abaixo para conectar o WhatsApp:`)
       qrcode.generate(qr, { small: true })
     }
 
@@ -74,12 +71,11 @@ async function connectToWhatsApp() {
 
     if (connection === 'open') {
       const user = sock?.user?.id?.split(':')[0]
-      console.log(`✅ [${EMPRESA_ID}] Conectado com sucesso! Número: ${user}`)
+      console.log(`✅ [${EMPRESA_ID}] WhatsApp conectado com sucesso! Número: ${user}`)
       connectionStatus = {
         connected: true,
         number: user,
-        lastUpdate: new Date().toISOString(),
-        empresa_id: EMPRESA_ID
+        lastUpdate: new Date().toISOString()
       }
     }
   })
@@ -88,8 +84,8 @@ async function connectToWhatsApp() {
   // 💬 RECEBIMENTO DE MENSAGENS
   // ================================
   sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages?.[0]
-    if (!msg || !msg.message) return
+    const msg = messages[0]
+    if (!msg.message) return
 
     const sender = msg.key.remoteJid
     const pushName = msg.pushName || 'Cliente'
@@ -107,31 +103,54 @@ async function connectToWhatsApp() {
         content = msg.message.imageMessage.caption || ''
         const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
         mediaBase64 = `data:${msg.message.imageMessage.mimetype};base64,${buffer.toString('base64')}`
+      } else if (msg.message.audioMessage) {
+        type = 'audio'
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
+        mediaBase64 = `data:${msg.message.audioMessage.mimetype};base64,${buffer.toString('base64')}`
+      } else if (msg.message.videoMessage) {
+        type = 'video'
+        content = msg.message.videoMessage.caption || ''
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
+        mediaBase64 = `data:${msg.message.videoMessage.mimetype};base64,${buffer.toString('base64')}`
+      } else if (msg.message.documentMessage) {
+        type = 'document'
+        content = msg.message.documentMessage.fileName || 'Arquivo recebido'
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
+        mediaBase64 = `data:${msg.message.documentMessage.mimetype};base64,${buffer.toString('base64')}`
       }
 
-      console.log(`📩 [${EMPRESA_ID}] ${sender}: ${content}`)
+      console.log(`📩 [${EMPRESA_ID}] Mensagem (${type}) recebida de ${sender}: ${content}`)
 
-      // Notificar Webhook
-      await fetch(WEBHOOK_URL, {
-        method: 'POST',
+      await supabase.from('chat_mensagens').insert([
+        { remetente: sender, mensagem: content, tipo: type, data_envio: new Date(), empresa_id: EMPRESA_ID }
+      ])
+
+      // ================================
+      // 🔔 ENVIO DO WEBHOOK
+      // ================================
+      const response = await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
+        method: "POST",
         headers: {
-          'Content-Type': 'application/json',
-          'X-Empresa-ID': EMPRESA_ID,
-          'X-Webhook-Secret': WEBHOOK_SECRET,
-          apikey: SUPABASE_ANON_KEY,
+          "Content-Type": "application/json",
+          "X-Empresa-ID": EMPRESA_ID,
+          "X-Webhook-Signature": BAILEYS_WEBHOOK_SECRET
         },
         body: JSON.stringify({
-          empresa_id: EMPRESA_ID,
           from: sender,
           message: content,
           name: pushName,
           type,
-          media: mediaBase64,
-          timestamp: new Date().toISOString(),
+          media: mediaBase64
         })
       })
+
+      if (response.ok)
+        console.log(`📨 [${EMPRESA_ID}] Webhook Lovable notificado com sucesso.`)
+      else
+        console.error(`⚠️ [${EMPRESA_ID}] Webhook respondeu com erro: ${response.status}`)
+
     } catch (err) {
-      console.error(`❌ [${EMPRESA_ID}] Erro:`, err.message)
+      console.error(`❌ [${EMPRESA_ID}] Erro no recebimento:`, err.message)
     }
   })
 
@@ -139,7 +158,7 @@ async function connectToWhatsApp() {
 }
 
 // ================================
-// 📡 ENDPOINTS
+// 📡 ENDPOINT STATUS
 // ================================
 app.get('/status', (req, res) => {
   res.json({
@@ -151,14 +170,73 @@ app.get('/status', (req, res) => {
   })
 })
 
+// ================================
+// ✉️ ENDPOINT ENVIO DE MENSAGEM
+// ================================
 app.post('/send-message', async (req, res) => {
   try {
-    const { number, message } = req.body
+    const { number, message, type, media } = req.body
+    if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
+
     const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
-    await sock.sendMessage(jid, { text: message })
-    res.json({ success: true, empresa_id: EMPRESA_ID })
+    let sentMsg = null
+
+    console.log(`📤 [${EMPRESA_ID}] Enviando mensagem para ${jid}: ${message || '(mídia)'}`)
+
+    if (media && type) {
+      const mediaBuffer = Buffer.from(media.split(',')[1], 'base64')
+      if (type === 'image') {
+        sentMsg = await sock.sendMessage(jid, { image: mediaBuffer, caption: message || '' })
+      } else if (type === 'audio') {
+        sentMsg = await sock.sendMessage(jid, { audio: mediaBuffer, mimetype: 'audio/mp4', ptt: true })
+      } else if (type === 'video') {
+        sentMsg = await sock.sendMessage(jid, { video: mediaBuffer, caption: message || '' })
+      } else if (type === 'document') {
+        sentMsg = await sock.sendMessage(jid, {
+          document: mediaBuffer,
+          mimetype: 'application/pdf',
+          fileName: message || 'arquivo.pdf'
+        })
+      }
+    } else {
+      sentMsg = await sock.sendMessage(jid, { text: message })
+    }
+
+    console.log(`✅ [${EMPRESA_ID}] Mensagem enviada com sucesso.`)
+
+    await supabase.from('chat_mensagens').insert([
+      {
+        remetente: connectionStatus.number,
+        destinatario: number,
+        mensagem: message || '(mídia)',
+        tipo: type || 'text',
+        data_envio: new Date(),
+        empresa_id: EMPRESA_ID
+      }
+    ])
+
+    res.json({ success: true, message: 'Mensagem enviada com sucesso.' })
   } catch (error) {
+    console.error(`❌ [${EMPRESA_ID}] Erro ao enviar mensagem:`, error)
     res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// ================================
+// 🚪 ENDPOINT LOGOUT
+// ================================
+app.get('/logout', async (req, res) => {
+  try {
+    if (sock) {
+      await sock.logout()
+      connectionStatus.connected = false
+      console.log(`🚪 [${EMPRESA_ID}] Sessão encerrada manualmente.`)
+      return res.json({ success: true, message: 'Sessão encerrada.' })
+    }
+    res.status(400).json({ success: false, message: 'Nenhuma sessão ativa.' })
+  } catch (err) {
+    console.error(`❌ [${EMPRESA_ID}] Erro ao desconectar:`, err)
+    res.status(500).json({ success: false, error: err.message })
   }
 })
 
@@ -166,6 +244,6 @@ app.post('/send-message', async (req, res) => {
 // 🚀 INICIALIZA SERVIDOR
 // ================================
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🌐 Servidor [${EMPRESA_ID}] rodando na porta ${PORT}`)
+  console.log(`🌐 [${EMPRESA_ID}] Servidor rodando na porta ${PORT}`)
   connectToWhatsApp()
 })
