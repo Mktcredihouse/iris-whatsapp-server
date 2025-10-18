@@ -12,7 +12,6 @@ import fetch from 'node-fetch'
 import dotenv from 'dotenv'
 import fs from 'fs'
 import ffmpeg from 'fluent-ffmpeg'
-import { PassThrough } from 'stream'
 
 dotenv.config()
 
@@ -90,7 +89,7 @@ app.get('/status', (req, res) => {
 })
 
 // ================================
-// ✉️ ENVIO DE MENSAGEM (DEBUG DE ÁUDIO)
+// ✉️ ENVIO DE MENSAGEM (com debug detalhado de áudio)
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
@@ -98,6 +97,14 @@ app.post('/send-message', async (req, res) => {
     if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
 
     const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
+
+    // === REQUEST DEBUG ===
+    console.log('=== REQUEST DEBUG ===')
+    console.log('Media type:', typeof media)
+    console.log('Media starts with data:audio/:', media?.startsWith('data:audio/'))
+    console.log('Media length:', media?.length)
+    console.log('First 100 chars:', media?.substring(0, 100))
+    console.log('=== END REQUEST DEBUG ===')
 
     // 🎧 DEBUG DE ÁUDIO
     if (media && media.startsWith('data:audio/')) {
@@ -111,7 +118,7 @@ app.post('/send-message', async (req, res) => {
 
       const tempFile = `/tmp/audio-${Date.now()}.ogg`
       fs.writeFileSync(tempFile, audioBuffer)
-      console.log('Audio saved to:', tempFile)
+      console.log('Temporary file saved at:', tempFile)
 
       try {
         console.log('Attempting to send as OGG/Opus...')
@@ -158,7 +165,7 @@ app.post('/send-message', async (req, res) => {
       return res.json({ success: true, message: 'Áudio processado (veja logs).' })
     }
 
-    // Outras mídias e textos
+    // 📎 OUTROS TIPOS (PDF / texto)
     if (media && fileName) {
       const response = await fetch(media)
       const buffer = await response.arrayBuffer()
