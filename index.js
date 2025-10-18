@@ -100,7 +100,7 @@ app.get('/status', (req, res) => {
 })
 
 // ================================
-// ✉️ ENDPOINT ENVIO DE MENSAGEM (CORRIGIDO E OTIMIZADO)
+// ✉️ ENDPOINT ENVIO DE MENSAGEM (FINAL COM ÁUDIO CORRIGIDO)
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
@@ -110,7 +110,43 @@ app.post('/send-message', async (req, res) => {
     const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
     console.log(`📤 [${EMPRESA_ID}] Enviando mensagem (${type || 'text'}) para ${jid}`)
 
-    let sentMsg = null
+    // ================================
+    // 🎧 Envio de ÁUDIO BASE64 (data:audio/ogg)
+    // ================================
+    if (media && media.startsWith('data:audio/')) {
+      console.log(`🎙️ [${EMPRESA_ID}] Processando envio de áudio base64...`)
+      const base64Audio = media.split(',')[1]
+      const audioBuffer = Buffer.from(base64Audio, 'base64')
+      console.log(`[${EMPRESA_ID}] Áudio convertido (${audioBuffer.length} bytes)`)
+
+      await sock.sendMessage(jid, {
+        audio: audioBuffer,
+        mimetype: 'audio/ogg; codecs=opus',
+        ptt: true
+      })
+
+      console.log(`✅ [${EMPRESA_ID}] Áudio enviado com sucesso.`)
+
+      // Webhook correto para áudio
+      await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Empresa-ID": EMPRESA_ID,
+          "X-Webhook-Signature": BAILEYS_WEBHOOK_SECRET
+        },
+        body: JSON.stringify({
+          from: connectionStatus.number,
+          to: number,
+          message: message || 'Áudio',
+          type: 'audio',
+          media: null,
+          fromMe: true
+        })
+      })
+
+      return res.json({ success: true, message: 'Áudio enviado com sucesso.' })
+    }
 
     // ================================
     // 📎 Envio de DOCUMENTO (PDF)
@@ -122,7 +158,7 @@ app.post('/send-message', async (req, res) => {
       const buffer = await response.arrayBuffer()
 
       console.log(`📄 [${EMPRESA_ID}] Enviando documento: ${fileName}`)
-      sentMsg = await sock.sendMessage(jid, {
+      await sock.sendMessage(jid, {
         document: Buffer.from(buffer),
         mimetype: 'application/pdf',
         fileName: fileName
@@ -130,7 +166,6 @@ app.post('/send-message', async (req, res) => {
 
       console.log(`✅ [${EMPRESA_ID}] Documento enviado com sucesso.`)
 
-      // Webhook correto para arquivo
       await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
         method: "POST",
         headers: {
@@ -153,50 +188,12 @@ app.post('/send-message', async (req, res) => {
     }
 
     // ================================
-    // 🎵 Envio de ÁUDIO
-    // ================================
-    if (media && type === 'audio') {
-      console.log(`🎧 [${EMPRESA_ID}] Baixando áudio de: ${media}`)
-      const response = await fetch(media)
-      if (!response.ok) throw new Error(`Erro ao baixar áudio: ${response.status}`)
-      const buffer = await response.arrayBuffer()
-
-      console.log(`🎙️ [${EMPRESA_ID}] Enviando áudio...`)
-      sentMsg = await sock.sendMessage(jid, {
-        audio: Buffer.from(buffer),
-        mimetype: 'audio/mp4',
-        ptt: true
-      })
-
-      console.log(`✅ [${EMPRESA_ID}] Áudio enviado com sucesso.`)
-
-      await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Empresa-ID": EMPRESA_ID,
-          "X-Webhook-Signature": BAILEYS_WEBHOOK_SECRET
-        },
-        body: JSON.stringify({
-          from: connectionStatus.number,
-          to: number,
-          message: 'Áudio enviado',
-          type: 'audio',
-          media: media,
-          fromMe: true
-        })
-      })
-
-      return res.json({ success: true, message: 'Áudio enviado com sucesso.' })
-    }
-
-    // ================================
     // 🖼️ Envio de IMAGEM
     // ================================
     if (media && type === 'image') {
       const response = await fetch(media)
       const buffer = await response.arrayBuffer()
-      sentMsg = await sock.sendMessage(jid, {
+      await sock.sendMessage(jid, {
         image: Buffer.from(buffer),
         caption: message || ''
       })
@@ -208,7 +205,7 @@ app.post('/send-message', async (req, res) => {
     else if (media && type === 'video') {
       const response = await fetch(media)
       const buffer = await response.arrayBuffer()
-      sentMsg = await sock.sendMessage(jid, {
+      await sock.sendMessage(jid, {
         video: Buffer.from(buffer),
         caption: message || ''
       })
@@ -218,7 +215,7 @@ app.post('/send-message', async (req, res) => {
     // 💬 Mensagem de TEXTO
     // ================================
     else {
-      sentMsg = await sock.sendMessage(jid, { text: message })
+      await sock.sendMessage(jid, { text: message })
     }
 
     console.log(`✅ [${EMPRESA_ID}] Mensagem enviada com sucesso.`)
