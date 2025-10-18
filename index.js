@@ -126,7 +126,7 @@ async function connectToWhatsApp() {
       ])
 
       // 🔔 Envio do Webhook
-      const response = await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
+      await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -142,11 +142,6 @@ async function connectToWhatsApp() {
           fromMe: false
         })
       })
-
-      if (response.ok)
-        console.log(`📨 [${EMPRESA_ID}] Webhook Lovable notificado com sucesso.`)
-      else
-        console.error(`⚠️ [${EMPRESA_ID}] Webhook respondeu com erro: ${response.status}`)
 
     } catch (err) {
       console.error(`❌ [${EMPRESA_ID}] Erro no recebimento:`, err.message)
@@ -170,7 +165,7 @@ app.get('/status', (req, res) => {
 })
 
 // ================================
-// ✉️ ENDPOINT ENVIO DE MENSAGEM (ATUALIZADO)
+// ✉️ ENDPOINT ENVIO DE MENSAGEM (CORRIGIDO)
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
@@ -182,7 +177,6 @@ app.post('/send-message', async (req, res) => {
 
     console.log(`📤 [${EMPRESA_ID}] Enviando mensagem (${type || 'text'}) para ${jid}`)
 
-    // Função para baixar arquivo remoto
     const downloadFile = async (url) => {
       const response = await fetch(url)
       if (!response.ok) throw new Error(`Erro ao baixar arquivo: ${response.status}`)
@@ -204,7 +198,6 @@ app.post('/send-message', async (req, res) => {
       const fileBuffer = await downloadFile(media)
       sentMsg = await sock.sendMessage(jid, { video: fileBuffer, caption: message || '' })
     } else {
-      // Texto simples
       sentMsg = await sock.sendMessage(jid, { text: message })
     }
 
@@ -222,7 +215,7 @@ app.post('/send-message', async (req, res) => {
       }
     ])
 
-    // Envia webhook de confirmação (com fromMe:true)
+    // ✅ Webhook de Confirmação CORRIGIDO
     await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
       method: "POST",
       headers: {
@@ -233,10 +226,11 @@ app.post('/send-message', async (req, res) => {
       body: JSON.stringify({
         from: connectionStatus.number,
         to: number,
-        message: message,
+        message: message || fileName || 'Arquivo enviado',
         type: type || 'text',
         media: media || null,
-        fromMe: true
+        fromMe: true,
+        fileName: fileName || null
       })
     })
 
