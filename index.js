@@ -80,74 +80,6 @@ async function connectToWhatsApp() {
     }
   })
 
-  // ================================
-  // 💬 RECEBIMENTO DE MENSAGENS
-  // ================================
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0]
-    if (!msg.message) return
-
-    const sender = msg.key.remoteJid
-    const pushName = msg.pushName || 'Cliente'
-    let content = ''
-    let type = 'text'
-    let mediaBase64 = null
-
-    try {
-      if (msg.message.conversation) {
-        content = msg.message.conversation
-      } else if (msg.message.extendedTextMessage) {
-        content = msg.message.extendedTextMessage.text
-      } else if (msg.message.imageMessage) {
-        type = 'image'
-        content = msg.message.imageMessage.caption || ''
-        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
-        mediaBase64 = `data:${msg.message.imageMessage.mimetype};base64,${buffer.toString('base64')}`
-      } else if (msg.message.audioMessage) {
-        type = 'audio'
-        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
-        mediaBase64 = `data:${msg.message.audioMessage.mimetype};base64,${buffer.toString('base64')}`
-      } else if (msg.message.videoMessage) {
-        type = 'video'
-        content = msg.message.videoMessage.caption || ''
-        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
-        mediaBase64 = `data:${msg.message.videoMessage.mimetype};base64,${buffer.toString('base64')}`
-      } else if (msg.message.documentMessage) {
-        type = 'document'
-        content = msg.message.documentMessage.fileName || 'Arquivo recebido'
-        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
-        mediaBase64 = `data:${msg.message.documentMessage.mimetype};base64,${buffer.toString('base64')}`
-      }
-
-      console.log(`📩 [${EMPRESA_ID}] Mensagem (${type}) recebida de ${sender}: ${content}`)
-
-      await supabase.from('chat_mensagens').insert([
-        { remetente: sender, mensagem: content, tipo: type, data_envio: new Date(), empresa_id: EMPRESA_ID }
-      ])
-
-      // 🔔 Envio do Webhook
-      await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Empresa-ID": EMPRESA_ID,
-          "X-Webhook-Signature": BAILEYS_WEBHOOK_SECRET
-        },
-        body: JSON.stringify({
-          from: sender,
-          message: content,
-          name: pushName,
-          type,
-          media: mediaBase64,
-          fromMe: false
-        })
-      })
-
-    } catch (err) {
-      console.error(`❌ [${EMPRESA_ID}] Erro no recebimento:`, err.message)
-    }
-  })
-
   sock.ev.on('creds.update', saveCreds)
 }
 
@@ -165,7 +97,7 @@ app.get('/status', (req, res) => {
 })
 
 // ================================
-// ✉️ ENDPOINT ENVIO DE MENSAGEM (CORRIGIDO)
+// ✉️ ENDPOINT ENVIO DE MENSAGEM (CORRIGIDO FINAL)
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
@@ -173,49 +105,84 @@ app.post('/send-message', async (req, res) => {
     if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
 
     const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
-    let sentMsg = null
-
     console.log(`📤 [${EMPRESA_ID}] Enviando mensagem (${type || 'text'}) para ${jid}`)
 
-    const downloadFile = async (url) => {
-      const response = await fetch(url)
+    let sentMsg = null
+
+    // ================================
+    // 📎 Envio de DOCUMENTO (PDF)
+    // ================================
+    if (media && fileName) {
+      console.log(`📎 [${EMPRESA_ID}] Baixando arquivo de: ${media}`)
+      const response = await fetch(media)
       if (!response.ok) throw new Error(`Erro ao baixar arquivo: ${response.status}`)
-      return Buffer.from(await response.arrayBuffer())
+      const buffer = await response.arrayBuffer()
+
+      console.log(`📄 [${EMPRESA_ID}] Enviando documento: ${fileName}`)
+      sentMsg = await sock.sendMessage(jid, {
+        document: Buffer.from(buffer),
+        mimetype: 'application/pdf',
+        fileName: fileName
+      })
+
+      console.log(`✅ [${EMPRESA_ID}] Documento enviado com sucesso.`)
+
+      // Webhook correto para arquivo
+      await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Empresa-ID": EMPRESA_ID,
+          "X-Webhook-Signature": BAILEYS_WEBHOOK_SECRET
+        },
+        body: JSON.stringify({
+          from: connectionStatus.number,
+          to: number,
+          message: `Arquivo: ${fileName}`,
+          type: "document",
+          media: media,
+          fromMe: true,
+          fileName: fileName
+        })
+      })
+
+      return res.json({ success: true, message: 'Arquivo enviado com sucesso.' })
     }
 
-    // Envio de mídia via URL
-    if (media && type === 'document') {
-      const fileBuffer = await downloadFile(media)
+    // ================================
+    // 🖼️ Envio de IMAGEM
+    // ================================
+    if (media && type === 'image') {
+      const response = await fetch(media)
+      const buffer = await response.arrayBuffer()
       sentMsg = await sock.sendMessage(jid, {
-        document: fileBuffer,
-        mimetype: 'application/pdf',
-        fileName: fileName || 'arquivo.pdf'
+        image: Buffer.from(buffer),
+        caption: message || ''
       })
-    } else if (media && type === 'image') {
-      const fileBuffer = await downloadFile(media)
-      sentMsg = await sock.sendMessage(jid, { image: fileBuffer, caption: message || '' })
-    } else if (media && type === 'video') {
-      const fileBuffer = await downloadFile(media)
-      sentMsg = await sock.sendMessage(jid, { video: fileBuffer, caption: message || '' })
-    } else {
+    }
+
+    // ================================
+    // 🎥 Envio de VÍDEO
+    // ================================
+    else if (media && type === 'video') {
+      const response = await fetch(media)
+      const buffer = await response.arrayBuffer()
+      sentMsg = await sock.sendMessage(jid, {
+        video: Buffer.from(buffer),
+        caption: message || ''
+      })
+    }
+
+    // ================================
+    // 💬 Mensagem de TEXTO
+    // ================================
+    else {
       sentMsg = await sock.sendMessage(jid, { text: message })
     }
 
     console.log(`✅ [${EMPRESA_ID}] Mensagem enviada com sucesso.`)
 
-    // Salva no Supabase
-    await supabase.from('chat_mensagens').insert([
-      {
-        remetente: connectionStatus.number,
-        destinatario: number,
-        mensagem: message || '(mídia)',
-        tipo: type || 'text',
-        data_envio: new Date(),
-        empresa_id: EMPRESA_ID
-      }
-    ])
-
-    // ✅ Webhook de Confirmação CORRIGIDO
+    // Webhook para mensagens de texto/mídia simples
     await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
       method: "POST",
       headers: {
@@ -226,11 +193,10 @@ app.post('/send-message', async (req, res) => {
       body: JSON.stringify({
         from: connectionStatus.number,
         to: number,
-        message: message || fileName || 'Arquivo enviado',
+        message: message,
         type: type || 'text',
         media: media || null,
-        fromMe: true,
-        fileName: fileName || null
+        fromMe: true
       })
     })
 
