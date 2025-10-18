@@ -125,9 +125,7 @@ async function connectToWhatsApp() {
         { remetente: sender, mensagem: content, tipo: type, data_envio: new Date(), empresa_id: EMPRESA_ID }
       ])
 
-      // ================================
-      // 🔔 ENVIO DO WEBHOOK
-      // ================================
+      // 🔔 Envio do Webhook
       const response = await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
         method: "POST",
         headers: {
@@ -140,7 +138,8 @@ async function connectToWhatsApp() {
           message: content,
           name: pushName,
           type,
-          media: mediaBase64
+          media: mediaBase64,
+          fromMe: false
         })
       })
 
@@ -171,39 +170,47 @@ app.get('/status', (req, res) => {
 })
 
 // ================================
-// ✉️ ENDPOINT ENVIO DE MENSAGEM
+// ✉️ ENDPOINT ENVIO DE MENSAGEM (ATUALIZADO)
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
-    const { number, message, type, media } = req.body
+    const { number, message, type, media, fileName } = req.body
     if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
 
     const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
     let sentMsg = null
 
-    console.log(`📤 [${EMPRESA_ID}] Enviando mensagem para ${jid}: ${message || '(mídia)'}`)
+    console.log(`📤 [${EMPRESA_ID}] Enviando mensagem (${type || 'text'}) para ${jid}`)
 
-    if (media && type) {
-      const mediaBuffer = Buffer.from(media.split(',')[1], 'base64')
-      if (type === 'image') {
-        sentMsg = await sock.sendMessage(jid, { image: mediaBuffer, caption: message || '' })
-      } else if (type === 'audio') {
-        sentMsg = await sock.sendMessage(jid, { audio: mediaBuffer, mimetype: 'audio/mp4', ptt: true })
-      } else if (type === 'video') {
-        sentMsg = await sock.sendMessage(jid, { video: mediaBuffer, caption: message || '' })
-      } else if (type === 'document') {
-        sentMsg = await sock.sendMessage(jid, {
-          document: mediaBuffer,
-          mimetype: 'application/pdf',
-          fileName: message || 'arquivo.pdf'
-        })
-      }
+    // Função para baixar arquivo remoto
+    const downloadFile = async (url) => {
+      const response = await fetch(url)
+      if (!response.ok) throw new Error(`Erro ao baixar arquivo: ${response.status}`)
+      return Buffer.from(await response.arrayBuffer())
+    }
+
+    // Envio de mídia via URL
+    if (media && type === 'document') {
+      const fileBuffer = await downloadFile(media)
+      sentMsg = await sock.sendMessage(jid, {
+        document: fileBuffer,
+        mimetype: 'application/pdf',
+        fileName: fileName || 'arquivo.pdf'
+      })
+    } else if (media && type === 'image') {
+      const fileBuffer = await downloadFile(media)
+      sentMsg = await sock.sendMessage(jid, { image: fileBuffer, caption: message || '' })
+    } else if (media && type === 'video') {
+      const fileBuffer = await downloadFile(media)
+      sentMsg = await sock.sendMessage(jid, { video: fileBuffer, caption: message || '' })
     } else {
+      // Texto simples
       sentMsg = await sock.sendMessage(jid, { text: message })
     }
 
     console.log(`✅ [${EMPRESA_ID}] Mensagem enviada com sucesso.`)
 
+    // Salva no Supabase
     await supabase.from('chat_mensagens').insert([
       {
         remetente: connectionStatus.number,
@@ -214,6 +221,24 @@ app.post('/send-message', async (req, res) => {
         empresa_id: EMPRESA_ID
       }
     ])
+
+    // Envia webhook de confirmação (com fromMe:true)
+    await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Empresa-ID": EMPRESA_ID,
+        "X-Webhook-Signature": BAILEYS_WEBHOOK_SECRET
+      },
+      body: JSON.stringify({
+        from: connectionStatus.number,
+        to: number,
+        message: message,
+        type: type || 'text',
+        media: media || null,
+        fromMe: true
+      })
+    })
 
     res.json({ success: true, message: 'Mensagem enviada com sucesso.' })
   } catch (error) {
