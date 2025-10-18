@@ -11,6 +11,8 @@ import qrcode from 'qrcode-terminal'
 import { Boom } from '@hapi/boom'
 import fetch from 'node-fetch'
 import dotenv from 'dotenv'
+import ffmpeg from 'fluent-ffmpeg'
+import { PassThrough } from 'stream'
 
 dotenv.config()
 
@@ -100,7 +102,7 @@ app.get('/status', (req, res) => {
 })
 
 // ================================
-// ✉️ ENDPOINT ENVIO DE MENSAGEM (FINAL COM ÁUDIO CORRIGIDO)
+// ✉️ ENDPOINT ENVIO DE MENSAGEM (FINAL COM ÁUDIO REVISADO)
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
@@ -111,23 +113,54 @@ app.post('/send-message', async (req, res) => {
     console.log(`📤 [${EMPRESA_ID}] Enviando mensagem (${type || 'text'}) para ${jid}`)
 
     // ================================
-    // 🎧 Envio de ÁUDIO BASE64 (data:audio/ogg)
+    // 🎧 Envio de ÁUDIO BASE64 (data:audio/...)
     // ================================
     if (media && media.startsWith('data:audio/')) {
       console.log(`🎙️ [${EMPRESA_ID}] Processando envio de áudio base64...`)
-      const base64Audio = media.split(',')[1]
-      const audioBuffer = Buffer.from(base64Audio, 'base64')
-      console.log(`[${EMPRESA_ID}] Áudio convertido (${audioBuffer.length} bytes)`)
 
-      await sock.sendMessage(jid, {
-        audio: audioBuffer,
-        mimetype: 'audio/ogg; codecs=opus',
-        ptt: true
-      })
+      // 1️⃣ Extrair base64 puro
+      const base64Data = media.split(',')[1] || media
+      const audioBuffer = Buffer.from(base64Data, 'base64')
 
-      console.log(`✅ [${EMPRESA_ID}] Áudio enviado com sucesso.`)
+      console.log(`[${EMPRESA_ID}] Audio buffer size: ${audioBuffer.length} bytes`)
+      if (audioBuffer.length === 0) throw new Error('Audio buffer is empty')
 
-      // Webhook correto para áudio
+      try {
+        // 2️⃣ Tentar enviar como OGG/Opus (nativo do WhatsApp)
+        await sock.sendMessage(jid, {
+          audio: audioBuffer,
+          mimetype: 'audio/ogg; codecs=opus',
+          ptt: true
+        })
+        console.log(`✅ [${EMPRESA_ID}] Áudio enviado com sucesso em formato OGG.`)
+      } catch (err) {
+        console.warn(`⚠️ [${EMPRESA_ID}] Erro ao enviar áudio OGG, tentando converter para MP3...`)
+
+        // 3️⃣ Converter para MP3 se OGG falhar
+        const convertedBuffer = await new Promise((resolve, reject) => {
+          const stream = new PassThrough()
+          stream.end(audioBuffer)
+
+          const chunks = []
+          ffmpeg(stream)
+            .toFormat('mp3')
+            .audioBitrate(128)
+            .on('error', reject)
+            .on('end', () => resolve(Buffer.concat(chunks)))
+            .pipe()
+            .on('data', chunk => chunks.push(chunk))
+        })
+
+        await sock.sendMessage(jid, {
+          audio: convertedBuffer,
+          mimetype: 'audio/mpeg',
+          ptt: true
+        })
+
+        console.log(`✅ [${EMPRESA_ID}] Áudio convertido e enviado como MP3.`)
+      }
+
+      // 4️⃣ Webhook de confirmação
       await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
         method: "POST",
         headers: {
@@ -152,19 +185,14 @@ app.post('/send-message', async (req, res) => {
     // 📎 Envio de DOCUMENTO (PDF)
     // ================================
     if (media && fileName) {
-      console.log(`📎 [${EMPRESA_ID}] Baixando arquivo de: ${media}`)
       const response = await fetch(media)
-      if (!response.ok) throw new Error(`Erro ao baixar arquivo: ${response.status}`)
       const buffer = await response.arrayBuffer()
 
-      console.log(`📄 [${EMPRESA_ID}] Enviando documento: ${fileName}`)
       await sock.sendMessage(jid, {
         document: Buffer.from(buffer),
         mimetype: 'application/pdf',
         fileName: fileName
       })
-
-      console.log(`✅ [${EMPRESA_ID}] Documento enviado com sucesso.`)
 
       await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
         method: "POST",
@@ -220,7 +248,6 @@ app.post('/send-message', async (req, res) => {
 
     console.log(`✅ [${EMPRESA_ID}] Mensagem enviada com sucesso.`)
 
-    // Webhook padrão
     await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
       method: "POST",
       headers: {
@@ -253,12 +280,10 @@ app.get('/logout', async (req, res) => {
     if (sock) {
       await sock.logout()
       connectionStatus.connected = false
-      console.log(`🚪 [${EMPRESA_ID}] Sessão encerrada manualmente.`)
       return res.json({ success: true, message: 'Sessão encerrada.' })
     }
     res.status(400).json({ success: false, message: 'Nenhuma sessão ativa.' })
   } catch (err) {
-    console.error(`❌ [${EMPRESA_ID}] Erro ao desconectar:`, err)
     res.status(500).json({ success: false, error: err.message })
   }
 })
