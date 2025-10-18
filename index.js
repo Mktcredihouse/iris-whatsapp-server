@@ -25,7 +25,10 @@ const BAILEYS_WEBHOOK_SECRET = process.env.BAILEYS_WEBHOOK_SECRET || "credlar-sh
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 const app = express()
-app.use(express.json())
+
+// ✅ Corrige erro "PayloadTooLargeError" ao enviar áudio ou mídia
+app.use(express.json({ limit: '50mb' }))
+app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
 let sock = null
 let connectionStatus = {
@@ -97,7 +100,7 @@ app.get('/status', (req, res) => {
 })
 
 // ================================
-// ✉️ ENDPOINT ENVIO DE MENSAGEM (CORRIGIDO FINAL)
+// ✉️ ENDPOINT ENVIO DE MENSAGEM (CORRIGIDO E OTIMIZADO)
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
@@ -150,6 +153,44 @@ app.post('/send-message', async (req, res) => {
     }
 
     // ================================
+    // 🎵 Envio de ÁUDIO
+    // ================================
+    if (media && type === 'audio') {
+      console.log(`🎧 [${EMPRESA_ID}] Baixando áudio de: ${media}`)
+      const response = await fetch(media)
+      if (!response.ok) throw new Error(`Erro ao baixar áudio: ${response.status}`)
+      const buffer = await response.arrayBuffer()
+
+      console.log(`🎙️ [${EMPRESA_ID}] Enviando áudio...`)
+      sentMsg = await sock.sendMessage(jid, {
+        audio: Buffer.from(buffer),
+        mimetype: 'audio/mp4',
+        ptt: true
+      })
+
+      console.log(`✅ [${EMPRESA_ID}] Áudio enviado com sucesso.`)
+
+      await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Empresa-ID": EMPRESA_ID,
+          "X-Webhook-Signature": BAILEYS_WEBHOOK_SECRET
+        },
+        body: JSON.stringify({
+          from: connectionStatus.number,
+          to: number,
+          message: 'Áudio enviado',
+          type: 'audio',
+          media: media,
+          fromMe: true
+        })
+      })
+
+      return res.json({ success: true, message: 'Áudio enviado com sucesso.' })
+    }
+
+    // ================================
     // 🖼️ Envio de IMAGEM
     // ================================
     if (media && type === 'image') {
@@ -182,7 +223,7 @@ app.post('/send-message', async (req, res) => {
 
     console.log(`✅ [${EMPRESA_ID}] Mensagem enviada com sucesso.`)
 
-    // Webhook para mensagens de texto/mídia simples
+    // Webhook padrão
     await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
       method: "POST",
       headers: {
