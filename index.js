@@ -48,6 +48,23 @@ async function connectToWhatsApp() {
     browser: ['IRIS CRM', 'Chrome', '4.0']
   })
 
+  // ==========================================================
+  // 🔍 DIAGNÓSTICO DE CONEXÃO E EVENTOS
+  // ==========================================================
+  console.log(`🟢 [${EMPRESA_ID}] Conexão Baileys estabelecida, aguardando mensagens...`)
+
+  sock.ev.on('connection.update', (update) => {
+    console.log(`🔌 [${EMPRESA_ID}] Connection update:`, update)
+  })
+
+  sock.ev.on('messages.upsert', (data) => {
+    console.log(`🧩 [${EMPRESA_ID}] Evento messages.upsert recebido do Baileys:`)
+    console.log(JSON.stringify(data, null, 2))
+  })
+
+  // ============================================
+  // EVENTO DE CONEXÃO
+  // ============================================
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
     if (qr) {
