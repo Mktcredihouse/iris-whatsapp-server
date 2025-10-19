@@ -16,7 +16,7 @@ import ffmpeg from 'fluent-ffmpeg'
 dotenv.config()
 
 const PORT = process.env.PORT || 10000
-const EMPRESA_ID = process.env.EMPRESA_ID || 'empresa-desconhecida'
+const EMPRESA_ID = process.env.EMPRESA_ID || 'credihouse'
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 const BAILEYS_WEBHOOK_SECRET = process.env.BAILEYS_WEBHOOK_SECRET || "credlar-shared-secret"
@@ -48,6 +48,7 @@ async function connectToWhatsApp() {
     browser: ['IRIS CRM', 'Chrome', '4.0']
   })
 
+  // 🔔 Listener de conexão
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
     if (qr) {
@@ -73,10 +74,51 @@ async function connectToWhatsApp() {
   })
 
   sock.ev.on('creds.update', saveCreds)
+
+  // ================================
+  // 📥 LISTENER DE MENSAGENS RECEBIDAS
+  // ================================
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    for (const msg of messages) {
+      try {
+        // Ignora mensagens enviadas por você mesmo
+        if (msg.key.fromMe) continue
+
+        const from = msg.key.remoteJid
+        const messageType = Object.keys(msg.message || {})[0] || 'unknown'
+        const messageText =
+          msg.message?.conversation ||
+          msg.message?.extendedTextMessage?.text ||
+          msg.message?.imageMessage?.caption ||
+          msg.message?.documentMessage?.fileName ||
+          ''
+
+        console.log(`📩 [${EMPRESA_ID}] Mensagem recebida de ${from}:`, messageText)
+
+        // Enviar para o webhook Supabase
+        await fetch(`${SUPABASE_URL}/functions/v1/baileys-webhook`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Empresa-ID': EMPRESA_ID,
+            'X-Webhook-Signature': BAILEYS_WEBHOOK_SECRET
+          },
+          body: JSON.stringify({
+            from: from,
+            message: messageText,
+            type: messageType === 'conversation' ? 'text' : messageType,
+            fromMe: false
+          })
+        })
+      } catch (err) {
+        console.error('❌ Erro ao processar mensagem recebida:', err)
+      }
+    }
+  })
 }
 
 // ================================
-// 📡 ENDPOINT STATUS
+// 📡 STATUS
 // ================================
 app.get('/status', (req, res) => {
   res.json({
@@ -89,98 +131,50 @@ app.get('/status', (req, res) => {
 })
 
 // ================================
-// ✉️ ENVIO DE MENSAGEM (com debug detalhado de áudio)
+// ✉️ ENVIO DE MENSAGEM
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
-    const { number, message, type, media, fileName } = req.body
+    const { number, message, media, fileName } = req.body
     if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
 
     const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
 
-    // === REQUEST DEBUG ===
-    console.log('=== REQUEST DEBUG ===')
-    console.log('Media type:', typeof media)
-    console.log('Media starts with data:audio/:', media?.startsWith('data:audio/'))
-    console.log('Media length:', media?.length)
-    console.log('First 100 chars:', media?.substring(0, 100))
-    console.log('=== END REQUEST DEBUG ===')
-
-    // 🎧 DEBUG DE ÁUDIO
+    // ÁUDIO
     if (media && media.startsWith('data:audio/')) {
-      console.log('=== AUDIO DEBUG ===')
+      console.log(`[${EMPRESA_ID}] Processando envio de áudio base64...`)
       const base64Data = media.split(',')[1] || media
-      console.log('Base64 length:', base64Data.length)
-
       const audioBuffer = Buffer.from(base64Data, 'base64')
-      console.log('Audio buffer size:', audioBuffer.length, 'bytes')
-      if (audioBuffer.length === 0) throw new Error('Audio buffer is empty')
+      console.log(`[${EMPRESA_ID}] Áudio convertido (${audioBuffer.length} bytes)`)
 
-      const tempFile = `/tmp/audio-${Date.now()}.ogg`
-      fs.writeFileSync(tempFile, audioBuffer)
-      console.log('Temporary file saved at:', tempFile)
-
-      try {
-        console.log('Attempting to send as OGG/Opus...')
-        await sock.sendMessage(jid, {
-          audio: audioBuffer,
-          mimetype: 'audio/ogg; codecs=opus',
-          ptt: true
-        })
-        console.log('✅ Audio sent successfully as OGG')
-      } catch (error) {
-        console.log('❌ Failed to send as OGG:', error.message)
-        console.log('Converting to MP3...')
-
-        const outputPath = `/tmp/audio-${Date.now()}.mp3`
-        await new Promise((resolve, reject) => {
-          ffmpeg(tempFile)
-            .toFormat('mp3')
-            .on('end', () => {
-              console.log('✅ Conversion to MP3 complete')
-              resolve()
-            })
-            .on('error', (err) => {
-              console.log('❌ Conversion failed:', err.message)
-              reject(err)
-            })
-            .save(outputPath)
-        })
-
-        const mp3Buffer = fs.readFileSync(outputPath)
-        console.log('MP3 buffer size:', mp3Buffer.length, 'bytes')
-
-        await sock.sendMessage(jid, {
-          audio: mp3Buffer,
-          mimetype: 'audio/mpeg',
-          ptt: true
-        })
-        console.log('✅ Audio sent successfully as MP3')
-
-        fs.unlinkSync(tempFile)
-        fs.unlinkSync(outputPath)
-      }
-
-      console.log('=== END AUDIO DEBUG ===')
-      return res.json({ success: true, message: 'Áudio processado (veja logs).' })
+      await sock.sendMessage(jid, {
+        audio: audioBuffer,
+        mimetype: 'audio/ogg; codecs=opus',
+        ptt: true
+      })
+      console.log(`[${EMPRESA_ID}] Áudio enviado com sucesso.`)
+      return res.json({ success: true, message: 'Áudio enviado com sucesso.' })
     }
 
-    // 📎 OUTROS TIPOS (PDF / texto)
+    // PDF
     if (media && fileName) {
       const response = await fetch(media)
       const buffer = await response.arrayBuffer()
       await sock.sendMessage(jid, {
         document: Buffer.from(buffer),
         mimetype: 'application/pdf',
-        fileName: fileName
+        fileName
       })
-      return res.json({ success: true, message: 'Arquivo enviado com sucesso.' })
-    } else {
-      await sock.sendMessage(jid, { text: message })
-      return res.json({ success: true, message: 'Mensagem enviada com sucesso.' })
+      console.log(`[${EMPRESA_ID}] PDF enviado: ${fileName}`)
+      return res.json({ success: true, message: 'PDF enviado com sucesso.' })
     }
+
+    // TEXTO
+    await sock.sendMessage(jid, { text: message })
+    console.log(`[${EMPRESA_ID}] Mensagem de texto enviada para ${jid}`)
+    return res.json({ success: true, message: 'Mensagem enviada com sucesso.' })
   } catch (error) {
-    console.error('❌ Erro geral:', error)
+    console.error('❌ Erro ao enviar mensagem:', error)
     res.status(500).json({ success: false, error: error.message })
   }
 })
