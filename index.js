@@ -1,40 +1,43 @@
-// ===============================
-// 📱 Servidor Baileys - IRIS WhatsApp
-// ===============================
-
-import makeWASocket, { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } from '@whiskeysockets/baileys'
-import express from 'express'
+import makeWASocket, {
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason,
+  downloadMediaMessage
+} from '@whiskeysockets/baileys'
+import { createClient } from '@supabase/supabase-js'
 import P from 'pino'
-import fs from 'fs'
+import express from 'express'
+import qrcode from 'qrcode-terminal'
+import { Boom } from '@hapi/boom'
 import fetch from 'node-fetch'
-import ffmpeg from 'fluent-ffmpeg'
-import { PassThrough } from 'stream'
 import dotenv from 'dotenv'
 
 dotenv.config()
 
-// ===============================
-// ⚙️ Variáveis de ambiente
-// ===============================
+// ================================
+// 🔧 CONFIGURAÇÕES GERAIS
+// ================================
 const PORT = process.env.PORT || 10000
-const EMPRESA_ID = process.env.EMPRESA_ID || 'credihouse'
-const SUPABASE_URL = process.env.SUPABASE_URL
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY
-const BAILEYS_WEBHOOK_SECRET = process.env.BAILEYS_WEBHOOK_SECRET
+const EMPRESA_ID = process.env.EMPRESA_ID || 'empresa-desconhecida'
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+const BAILEYS_WEBHOOK_SECRET = process.env.BAILEYS_WEBHOOK_SECRET || "credlar-shared-secret"
 
-// ===============================
-// 🧠 Inicialização Express
-// ===============================
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 const app = express()
-app.use(express.json({ limit: '50mb' }))
-app.use(express.urlencoded({ limit: '50mb', extended: true }))
+app.use(express.json())
 
-let sock
+let sock = null
+let connectionStatus = {
+  connected: false,
+  number: null,
+  lastUpdate: null
+}
 
-// ===============================
-// 🔄 Função principal
-// ===============================
-async function startSock() {
+// ================================
+// 🔐 CONEXÃO COM WHATSAPP
+// ================================
+async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('./session')
   const { version } = await fetchLatestBaileysVersion()
 
@@ -42,180 +45,190 @@ async function startSock() {
     version,
     printQRInTerminal: true,
     auth: state,
-    logger: P({ level: 'silent' })
+    logger: P({ level: 'silent' }),
+    browser: ['IRIS CRM', 'Chrome', '4.0']
   })
 
-  console.log(`🟢 [${EMPRESA_ID}] Servidor rodando na porta ${PORT}`)
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update
 
-  // ===============================
-  // 🔌 Atualização de conexão
-  // ===============================
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update
+    if (qr) {
+      console.clear()
+      console.log(`📱 [${EMPRESA_ID}] Escaneie o QR Code abaixo para conectar o WhatsApp:`)
+      qrcode.generate(qr, { small: true })
+    }
+
     if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
-      console.log(`⚠️ [${EMPRESA_ID}] Conexão encerrada:`, lastDisconnect?.error?.message)
-      if (shouldReconnect) {
-        console.log(`♻️ [${EMPRESA_ID}] Tentando reconectar...`)
-        startSock()
-      } else {
-        console.log(`🚫 [${EMPRESA_ID}] Sessão encerrada permanentemente.`)
+      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
+      console.log(`⚠️ [${EMPRESA_ID}] Conexão encerrada:`, reason)
+      connectionStatus.connected = false
+      connectionStatus.number = null
+      if (reason !== DisconnectReason.loggedOut) {
+        console.log('🔄 Tentando reconectar...')
+        connectToWhatsApp()
       }
-    } else if (connection === 'open') {
-      console.log(`✅ [${EMPRESA_ID}] WhatsApp conectado com sucesso! Número: ${sock.user.id}`)
+    }
+
+    if (connection === 'open') {
+      const user = sock?.user?.id?.split(':')[0]
+      console.log(`✅ [${EMPRESA_ID}] WhatsApp conectado com sucesso! Número: ${user}`)
+      connectionStatus = {
+        connected: true,
+        number: user,
+        lastUpdate: new Date().toISOString()
+      }
     }
   })
 
   sock.ev.on('creds.update', saveCreds)
-
-  // ===============================
-  // 📨 Listener - Mensagens Recebidas
-  // ===============================
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    console.log(`🔔 [${EMPRESA_ID}] Evento 'messages.upsert' disparado! Total de mensagens: ${messages.length}`)
-
-    for (const msg of messages) {
-      const from = msg.key.remoteJid
-      const isFromMe = msg.key.fromMe || false
-      console.log(`📩 [${EMPRESA_ID}] Mensagem recebida de: ${from} | fromMe: ${isFromMe}`)
-
-      if (isFromMe) {
-        console.log(`⏭️ [${EMPRESA_ID}] Ignorando mensagem fromMe=true`)
-        continue
-      }
-
-      const messageType = Object.keys(msg.message || {})[0] || 'unknown'
-      const messageText =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        msg.message?.documentMessage?.fileName ||
-        ''
-
-      console.log(`💬 [${EMPRESA_ID}] Conteúdo recebido: "${messageText}" (tipo: ${messageType})`)
-
-      try {
-        const payload = {
-          from,
-          message: messageText,
-          type: messageType === 'conversation' ? 'text' : messageType,
-          fromMe: false
-        }
-
-        const response = await fetch(`${SUPABASE_URL}/functions/v1/baileys-webhook`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Empresa-ID': EMPRESA_ID,
-            'X-Webhook-Signature': BAILEYS_WEBHOOK_SECRET
-          },
-          body: JSON.stringify(payload)
-        })
-
-        console.log(`✅ [${EMPRESA_ID}] Webhook respondeu (${response.status})`)
-      } catch (err) {
-        console.error(`❌ [${EMPRESA_ID}] Erro ao enviar webhook:`, err.message)
-      }
-    }
-  })
-
-  // ===============================
-  // 🧾 Endpoint - Envio de Mensagem
-  // ===============================
-  app.post('/send-message', async (req, res) => {
-    try {
-      const { number, message, media, fileName } = req.body
-      const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
-
-      if (!number) return res.status(400).json({ success: false, error: 'Número não fornecido.' })
-
-      // ===============================
-      // 📎 Envio de Documentos (PDF)
-      // ===============================
-      if (media && fileName && media.startsWith('https://')) {
-        console.log(`[${EMPRESA_ID}] Enviando documento ${fileName}...`)
-        const response = await fetch(media)
-        const buffer = await response.arrayBuffer()
-
-        await sock.sendMessage(jid, {
-          document: Buffer.from(buffer),
-          mimetype: 'application/pdf',
-          fileName
-        })
-
-        console.log(`[${EMPRESA_ID}] Documento enviado com sucesso: ${fileName}`)
-        return res.json({ success: true, message: 'Documento enviado com sucesso.' })
-      }
-
-      // ===============================
-      // 🎤 Envio de Áudio Base64
-      // ===============================
-      if (media && media.startsWith('data:audio/')) {
-        console.log(`=== AUDIO DEBUG ===`)
-        console.log(`[${EMPRESA_ID}] Processando envio de áudio base64...`)
-
-        const base64Data = media.split(',')[1] || media
-        const audioBuffer = Buffer.from(base64Data, 'base64')
-        console.log(`[${EMPRESA_ID}] Audio buffer size: ${audioBuffer.length} bytes`)
-
-        const tempOggPath = `/tmp/audio-${Date.now()}.ogg`
-        const tempMp3Path = `/tmp/audio-${Date.now()}.mp3`
-        fs.writeFileSync(tempOggPath, audioBuffer)
-        console.log(`[${EMPRESA_ID}] Temporary OGG file saved at: ${tempOggPath}`)
-
-        try {
-          console.log(`[${EMPRESA_ID}] Tentando enviar como OGG...`)
-          await sock.sendMessage(jid, {
-            audio: audioBuffer,
-            mimetype: 'audio/ogg; codecs=opus',
-            ptt: true
-          })
-          console.log(`[${EMPRESA_ID}] ✅ Áudio OGG enviado com sucesso.`)
-          fs.unlinkSync(tempOggPath)
-          return res.json({ success: true, message: 'Áudio enviado com sucesso.' })
-        } catch (oggError) {
-          console.log(`[${EMPRESA_ID}] ⚠️ Falha ao enviar OGG, convertendo para MP3...`)
-
-          await new Promise((resolve, reject) => {
-            ffmpeg(tempOggPath)
-              .toFormat('mp3')
-              .on('end', resolve)
-              .on('error', reject)
-              .save(tempMp3Path)
-          })
-
-          const mp3Buffer = fs.readFileSync(tempMp3Path)
-          console.log(`[${EMPRESA_ID}] MP3 buffer size: ${mp3Buffer.length} bytes`)
-
-          await sock.sendMessage(jid, {
-            audio: mp3Buffer,
-            mimetype: 'audio/mpeg',
-            ptt: true
-          })
-          console.log(`[${EMPRESA_ID}] ✅ Áudio MP3 enviado com sucesso.`)
-
-          fs.unlinkSync(tempOggPath)
-          fs.unlinkSync(tempMp3Path)
-          return res.json({ success: true, message: 'Áudio MP3 enviado com sucesso.' })
-        }
-      }
-
-      // ===============================
-      // 💬 Envio de Texto
-      // ===============================
-      await sock.sendMessage(jid, { text: message || '' })
-      console.log(`[${EMPRESA_ID}] Mensagem de texto enviada para ${jid}`)
-      return res.json({ success: true, message: 'Mensagem enviada com sucesso.' })
-    } catch (error) {
-      console.error(`[${EMPRESA_ID}] Erro ao enviar mensagem:`, error.message)
-      return res.status(500).json({ success: false, error: error.message })
-    }
-  })
-
-  // ===============================
-  // 🚀 Inicialização Servidor
-  // ===============================
-  app.listen(PORT, () => console.log(`🌐 [${EMPRESA_ID}] Servidor HTTP rodando na porta ${PORT}`))
 }
 
-startSock()
+// ================================
+// 📡 ENDPOINT STATUS
+// ================================
+app.get('/status', (req, res) => {
+  res.json({
+    success: true,
+    empresa_id: EMPRESA_ID,
+    connected: connectionStatus.connected,
+    number: connectionStatus.number,
+    lastUpdate: connectionStatus.lastUpdate
+  })
+})
+
+// ================================
+// ✉️ ENDPOINT ENVIO DE MENSAGEM (CORRIGIDO FINAL)
+// ================================
+app.post('/send-message', async (req, res) => {
+  try {
+    const { number, message, type, media, fileName } = req.body
+    if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
+
+    const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
+    console.log(`📤 [${EMPRESA_ID}] Enviando mensagem (${type || 'text'}) para ${jid}`)
+
+    let sentMsg = null
+
+    // ================================
+    // 📎 Envio de DOCUMENTO (PDF)
+    // ================================
+    if (media && fileName) {
+      console.log(`📎 [${EMPRESA_ID}] Baixando arquivo de: ${media}`)
+      const response = await fetch(media)
+      if (!response.ok) throw new Error(`Erro ao baixar arquivo: ${response.status}`)
+      const buffer = await response.arrayBuffer()
+
+      console.log(`📄 [${EMPRESA_ID}] Enviando documento: ${fileName}`)
+      sentMsg = await sock.sendMessage(jid, {
+        document: Buffer.from(buffer),
+        mimetype: 'application/pdf',
+        fileName: fileName
+      })
+
+      console.log(`✅ [${EMPRESA_ID}] Documento enviado com sucesso.`)
+
+      // Webhook correto para arquivo
+      await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Empresa-ID": EMPRESA_ID,
+          "X-Webhook-Signature": BAILEYS_WEBHOOK_SECRET
+        },
+        body: JSON.stringify({
+          from: connectionStatus.number,
+          to: number,
+          message: `Arquivo: ${fileName}`,
+          type: "document",
+          media: media,
+          fromMe: true,
+          fileName: fileName
+        })
+      })
+
+      return res.json({ success: true, message: 'Arquivo enviado com sucesso.' })
+    }
+
+    // ================================
+    // 🖼️ Envio de IMAGEM
+    // ================================
+    if (media && type === 'image') {
+      const response = await fetch(media)
+      const buffer = await response.arrayBuffer()
+      sentMsg = await sock.sendMessage(jid, {
+        image: Buffer.from(buffer),
+        caption: message || ''
+      })
+    }
+
+    // ================================
+    // 🎥 Envio de VÍDEO
+    // ================================
+    else if (media && type === 'video') {
+      const response = await fetch(media)
+      const buffer = await response.arrayBuffer()
+      sentMsg = await sock.sendMessage(jid, {
+        video: Buffer.from(buffer),
+        caption: message || ''
+      })
+    }
+
+    // ================================
+    // 💬 Mensagem de TEXTO
+    // ================================
+    else {
+      sentMsg = await sock.sendMessage(jid, { text: message })
+    }
+
+    console.log(`✅ [${EMPRESA_ID}] Mensagem enviada com sucesso.`)
+
+    // Webhook para mensagens de texto/mídia simples
+    await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Empresa-ID": EMPRESA_ID,
+        "X-Webhook-Signature": BAILEYS_WEBHOOK_SECRET
+      },
+      body: JSON.stringify({
+        from: connectionStatus.number,
+        to: number,
+        message: message,
+        type: type || 'text',
+        media: media || null,
+        fromMe: true
+      })
+    })
+
+    res.json({ success: true, message: 'Mensagem enviada com sucesso.' })
+  } catch (error) {
+    console.error(`❌ [${EMPRESA_ID}] Erro ao enviar mensagem:`, error)
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// ================================
+// 🚪 ENDPOINT LOGOUT
+// ================================
+app.get('/logout', async (req, res) => {
+  try {
+    if (sock) {
+      await sock.logout()
+      connectionStatus.connected = false
+      console.log(`🚪 [${EMPRESA_ID}] Sessão encerrada manualmente.`)
+      return res.json({ success: true, message: 'Sessão encerrada.' })
+    }
+    res.status(400).json({ success: false, message: 'Nenhuma sessão ativa.' })
+  } catch (err) {
+    console.error(`❌ [${EMPRESA_ID}] Erro ao desconectar:`, err)
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// ================================
+// 🚀 INICIALIZA SERVIDOR
+// ================================
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🌐 [${EMPRESA_ID}] Servidor rodando na porta ${PORT}`)
+  connectToWhatsApp()
+})
