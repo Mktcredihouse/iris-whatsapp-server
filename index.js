@@ -25,7 +25,7 @@ const BAILEYS_WEBHOOK_SECRET = process.env.BAILEYS_WEBHOOK_SECRET || "credlar-sh
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 const app = express()
-app.use(express.json())
+app.use(express.json({ limit: '50mb' }))
 
 let sock = null
 let connectionStatus = {
@@ -87,9 +87,11 @@ async function connectToWhatsApp() {
     const msg = messages[0]
     if (!msg.message) return
 
-    // ✅ CRÍTICO: Ignorar mensagens enviadas pela própria IRIS
+    console.log('📋 Mensagem detectada:', JSON.stringify(msg.key, null, 2))
+
+    // ✅ IGNORA MENSAGENS ENVIADAS PELA PRÓPRIA IRIS
     if (msg.key.fromMe) {
-      console.log(`⏭️ [${EMPRESA_ID}] Mensagem ignorada (enviada pela IRIS - fromMe: true)`)
+      console.log('⏩ Ignorando mensagem enviada pela IRIS (fromMe: true)')
       return
     }
 
@@ -125,26 +127,26 @@ async function connectToWhatsApp() {
         mediaBase64 = `data:${msg.message.documentMessage.mimetype};base64,${buffer.toString('base64')}`
       }
 
-      console.log(`📩 [${EMPRESA_ID}] Mensagem (${type}) RECEBIDA de CLIENTE ${sender}: ${content}`)
+      console.log(`📥 [${EMPRESA_ID}] Mensagem RECEBIDA de cliente - ${type} de ${sender}: ${content}`)
 
       await supabase.from('chat_mensagens').insert([
         { remetente: sender, mensagem: content, tipo: type, data_envio: new Date(), empresa_id: EMPRESA_ID }
       ])
 
       // ================================
-      // 🔔 ENVIO DO WEBHOOK (CORRIGIDO)
+      // 🔔 ENVIO DO WEBHOOK
       // ================================
       const webhookPayload = {
-        from: sender,  // ✅ Número do cliente que enviou
-        to: `${connectionStatus.number}@s.whatsapp.net`,  // ✅ Número da IRIS
+        from: sender,                          // ✅ Número do cliente (quem enviou)
+        to: connectionStatus.number,           // ✅ Número da IRIS (quem recebeu)
         message: content,
         name: pushName,
         type,
         media: mediaBase64,
-        fromMe: false  // ✅ SEMPRE false aqui porque já filtramos acima
+        fromMe: false                          // ✅ Explicitamente FALSE
       }
 
-      console.log(`🔔 [${EMPRESA_ID}] Enviando para webhook:`, JSON.stringify(webhookPayload, null, 2))
+      console.log('📤 Payload do webhook:', JSON.stringify(webhookPayload, null, 2))
 
       const response = await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
         method: "POST",
@@ -156,12 +158,10 @@ async function connectToWhatsApp() {
         body: JSON.stringify(webhookPayload)
       })
 
-      if (response.ok) {
-        const responseData = await response.json()
-        console.log(`✅ [${EMPRESA_ID}] Webhook respondeu OK:`, responseData)
-      } else {
-        console.error(`⚠️ [${EMPRESA_ID}] Webhook erro ${response.status}:`, await response.text())
-      }
+      if (response.ok)
+        console.log(`✅ [${EMPRESA_ID}] Webhook Lovable notificado com sucesso.`)
+      else
+        console.error(`⚠️ [${EMPRESA_ID}] Webhook respondeu com erro: ${response.status}`)
 
     } catch (err) {
       console.error(`❌ [${EMPRESA_ID}] Erro no recebimento:`, err.message)
@@ -185,38 +185,81 @@ app.get('/status', (req, res) => {
 })
 
 // ================================
-// ✉️ ENDPOINT ENVIO DE MENSAGEM
+// ✉️ ENDPOINT ENVIO DE MENSAGEM (COM SUPORTE A URL)
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
-    const { number, message, type, media } = req.body
+    const { number, message, type, media, fileName } = req.body
     if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
 
     const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
     let sentMsg = null
 
-    console.log(`📤 [${EMPRESA_ID}] Enviando mensagem para ${jid}: ${message || '(mídia)'}`)
+    console.log(`📤 [${EMPRESA_ID}] Enviando mensagem para ${jid}:`, { type, message: message?.substring(0, 50), hasMedia: !!media })
 
-    if (media && type) {
-      const mediaBuffer = Buffer.from(media.split(',')[1], 'base64')
+    if (media) {
+      let mediaBuffer;
+      
+      // ✅ Se for URL, fazer download primeiro
+      if (media.startsWith('http://') || media.startsWith('https://')) {
+        console.log(`🔽 [${EMPRESA_ID}] Baixando mídia de URL: ${media.substring(0, 80)}...`)
+        const response = await fetch(media)
+        if (!response.ok) throw new Error(`Erro ao baixar mídia: ${response.status}`)
+        mediaBuffer = Buffer.from(await response.arrayBuffer())
+        console.log(`✅ [${EMPRESA_ID}] Mídia baixada com sucesso: ${mediaBuffer.length} bytes`)
+      } 
+      // ✅ Se for base64 com data URI
+      else if (media.startsWith('data:')) {
+        console.log(`🔄 [${EMPRESA_ID}] Convertendo base64 (data URI)`)
+        mediaBuffer = Buffer.from(media.split(',')[1], 'base64')
+      } 
+      // ✅ Se for base64 puro
+      else {
+        console.log(`🔄 [${EMPRESA_ID}] Convertendo base64 puro`)
+        mediaBuffer = Buffer.from(media, 'base64')
+      }
+
+      // ✅ Enviar baseado no tipo
       if (type === 'image') {
+        console.log(`📷 [${EMPRESA_ID}] Enviando imagem...`)
         sentMsg = await sock.sendMessage(jid, { image: mediaBuffer, caption: message || '' })
       } else if (type === 'audio') {
+        console.log(`🎵 [${EMPRESA_ID}] Enviando áudio...`)
         sentMsg = await sock.sendMessage(jid, { audio: mediaBuffer, mimetype: 'audio/mp4', ptt: true })
       } else if (type === 'video') {
+        console.log(`🎬 [${EMPRESA_ID}] Enviando vídeo...`)
         sentMsg = await sock.sendMessage(jid, { video: mediaBuffer, caption: message || '' })
       } else if (type === 'document') {
+        const docFileName = fileName || message || 'arquivo.pdf'
+        console.log(`📄 [${EMPRESA_ID}] Enviando documento: ${docFileName}`)
         sentMsg = await sock.sendMessage(jid, {
           document: mediaBuffer,
           mimetype: 'application/pdf',
-          fileName: message || 'arquivo.pdf'
+          fileName: docFileName
         })
+      } else {
+        // Se não especificou tipo mas tem mídia, tentar detectar pela extensão
+        const ext = media.split('.').pop()?.split('?')[0]?.toLowerCase()
+        console.log(`🔍 [${EMPRESA_ID}] Tipo não especificado, detectando pela extensão: ${ext}`)
+        
+        if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) {
+          sentMsg = await sock.sendMessage(jid, { image: mediaBuffer, caption: message || '' })
+        } else if (['pdf', 'doc', 'docx', 'xlsx'].includes(ext)) {
+          sentMsg = await sock.sendMessage(jid, {
+            document: mediaBuffer,
+            mimetype: 'application/pdf',
+            fileName: fileName || message || 'arquivo.pdf'
+          })
+        } else {
+          throw new Error(`Tipo de mídia não suportado: ${ext}`)
+        }
       }
     } else {
+      console.log(`💬 [${EMPRESA_ID}] Enviando mensagem de texto`)
       sentMsg = await sock.sendMessage(jid, { text: message })
     }
 
-    console.log(`✅ [${EMPRESA_ID}] Mensagem enviada com sucesso.`)
+    console.log(`✅ [${EMPRESA_ID}] Mensagem enviada com sucesso!`)
 
     await supabase.from('chat_mensagens').insert([
       {
@@ -258,6 +301,6 @@ app.get('/logout', async (req, res) => {
 // 🚀 INICIALIZA SERVIDOR
 // ================================
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🌐 [${EMPRESA_ID}] Servidor rodando na porta ${PORT}`)
+  console.log(`🌐 [${EMPRESA_ID}] Servidor Baileys rodando na porta ${PORT}`)
   connectToWhatsApp()
 })
