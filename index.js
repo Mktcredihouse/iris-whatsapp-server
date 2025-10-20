@@ -1,5 +1,5 @@
 // ===============================
-// IRIS WHATSAPP SERVER - v1.6.2
+// IRIS WHATSAPP SERVER - v1.7.0 (FINAL DIAGNÓSTICO)
 // ===============================
 
 import makeWASocket, {
@@ -44,12 +44,11 @@ async function iniciarWhatsApp() {
     logger: P({ level: 'info' }),
   })
 
-  // Salva credenciais a cada mudança
   sock.ev.on('creds.update', saveCreds)
 
-  // Listener de atualização de conexão
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect } = update
+
     if (connection === 'close') {
       const reason = lastDisconnect?.error?.output?.statusCode
       if (reason === DisconnectReason.loggedOut) {
@@ -61,6 +60,7 @@ async function iniciarWhatsApp() {
       }
     } else if (connection === 'open') {
       console.log(`✅ [${EMPRESA_ID}] WhatsApp conectado com sucesso! Número: ${sock.user.id}`)
+      console.log(`🟢 [${EMPRESA_ID}] Conexão Baileys estabelecida, aguardando mensagens...`)
     }
   })
 
@@ -90,13 +90,11 @@ async function iniciarWhatsApp() {
           messageText,
         })
 
-        // Ignora mensagens enviadas pelo próprio sistema
         if (fromMe) {
           console.log(`⏭️ [${EMPRESA_ID}] Ignorando mensagem enviada pelo sistema (fromMe=true)`)
           continue
         }
 
-        // Envia webhook
         const payload = {
           from: remoteJid,
           message: messageText,
@@ -138,7 +136,6 @@ async function iniciarWhatsApp() {
     })
   })
 
-  // Envio de mensagens (texto, áudio, PDF)
   app.post('/send-message', async (req, res) => {
     try {
       const { number, message, media, fileName } = req.body
@@ -148,7 +145,6 @@ async function iniciarWhatsApp() {
         console.log(`[${EMPRESA_ID}] Processando envio de áudio base64...`)
         const base64Data = media.split(',')[1] || media
         const audioBuffer = Buffer.from(base64Data, 'base64')
-
         console.log(`[${EMPRESA_ID}] Audio buffer size: ${audioBuffer.length} bytes`)
 
         await sock.sendMessage(jid, {
@@ -175,7 +171,6 @@ async function iniciarWhatsApp() {
         return res.json({ success: true })
       }
 
-      // Texto comum
       await sock.sendMessage(jid, { text: message })
       console.log(`[${EMPRESA_ID}] Mensagem enviada com sucesso para ${jid}`)
       res.json({ success: true })
@@ -188,7 +183,11 @@ async function iniciarWhatsApp() {
   app.listen(PORT, () => {
     console.log(`🌐 [${EMPRESA_ID}] Servidor rodando na porta ${PORT}`)
   })
+
+  // Log periódico para confirmar vida
+  setInterval(() => {
+    console.log(`[${EMPRESA_ID}] 🔄 Listener ativo e aguardando mensagens...`)
+  }, 15000)
 }
 
-// Iniciar
 iniciarWhatsApp().catch((err) => console.error('Erro na inicialização:', err))
