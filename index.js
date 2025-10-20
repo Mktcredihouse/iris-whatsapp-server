@@ -18,7 +18,7 @@ dotenv.config()
 // 🔧 CONFIGURAÇÕES GERAIS
 // ================================
 const PORT = process.env.PORT || 10000
-const EMPRESA_ID = process.env.EMPRESA_ID || 'empresa-desconhecida'
+const EMPRESA_ID = process.env.EMPRESA_ID || 'Credihouse'
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 const BAILEYS_WEBHOOK_SECRET = process.env.BAILEYS_WEBHOOK_SECRET || "credlar-shared-secret"
@@ -87,6 +87,12 @@ async function connectToWhatsApp() {
     const msg = messages[0]
     if (!msg.message) return
 
+    // ✅ CRÍTICO: Ignorar mensagens enviadas pela própria IRIS
+    if (msg.key.fromMe) {
+      console.log(`⏭️ [${EMPRESA_ID}] Mensagem ignorada (enviada pela IRIS - fromMe: true)`)
+      return
+    }
+
     const sender = msg.key.remoteJid
     const pushName = msg.pushName || 'Cliente'
     let content = ''
@@ -119,15 +125,27 @@ async function connectToWhatsApp() {
         mediaBase64 = `data:${msg.message.documentMessage.mimetype};base64,${buffer.toString('base64')}`
       }
 
-      console.log(`📩 [${EMPRESA_ID}] Mensagem (${type}) recebida de ${sender}: ${content}`)
+      console.log(`📩 [${EMPRESA_ID}] Mensagem (${type}) RECEBIDA de CLIENTE ${sender}: ${content}`)
 
       await supabase.from('chat_mensagens').insert([
         { remetente: sender, mensagem: content, tipo: type, data_envio: new Date(), empresa_id: EMPRESA_ID }
       ])
 
       // ================================
-      // 🔔 ENVIO DO WEBHOOK
+      // 🔔 ENVIO DO WEBHOOK (CORRIGIDO)
       // ================================
+      const webhookPayload = {
+        from: sender,  // ✅ Número do cliente que enviou
+        to: `${connectionStatus.number}@s.whatsapp.net`,  // ✅ Número da IRIS
+        message: content,
+        name: pushName,
+        type,
+        media: mediaBase64,
+        fromMe: false  // ✅ SEMPRE false aqui porque já filtramos acima
+      }
+
+      console.log(`🔔 [${EMPRESA_ID}] Enviando para webhook:`, JSON.stringify(webhookPayload, null, 2))
+
       const response = await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
         method: "POST",
         headers: {
@@ -135,19 +153,15 @@ async function connectToWhatsApp() {
           "X-Empresa-ID": EMPRESA_ID,
           "X-Webhook-Signature": BAILEYS_WEBHOOK_SECRET
         },
-        body: JSON.stringify({
-          from: sender,
-          message: content,
-          name: pushName,
-          type,
-          media: mediaBase64
-        })
+        body: JSON.stringify(webhookPayload)
       })
 
-      if (response.ok)
-        console.log(`📨 [${EMPRESA_ID}] Webhook Lovable notificado com sucesso.`)
-      else
-        console.error(`⚠️ [${EMPRESA_ID}] Webhook respondeu com erro: ${response.status}`)
+      if (response.ok) {
+        const responseData = await response.json()
+        console.log(`✅ [${EMPRESA_ID}] Webhook respondeu OK:`, responseData)
+      } else {
+        console.error(`⚠️ [${EMPRESA_ID}] Webhook erro ${response.status}:`, await response.text())
+      }
 
     } catch (err) {
       console.error(`❌ [${EMPRESA_ID}] Erro no recebimento:`, err.message)
