@@ -15,6 +15,9 @@ import ffmpeg from 'fluent-ffmpeg'
 
 dotenv.config()
 
+// ===================================================
+// 🔧 VARIÁVEIS GERAIS
+// ===================================================
 const PORT = process.env.PORT || 10000
 const EMPRESA_ID = process.env.EMPRESA_ID || 'credihouse'
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
@@ -26,21 +29,20 @@ const app = express()
 app.use(express.json({ limit: '50mb' }))
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
-let sock = null
 let connectionStatus = {
   connected: false,
   number: null,
   lastUpdate: null
 }
 
-// ============================================
-// 🔐 CONEXÃO COM WHATSAPP
-// ============================================
+// ===================================================
+// 🔐 FUNÇÃO PRINCIPAL
+// ===================================================
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('./session')
   const { version } = await fetchLatestBaileysVersion()
 
-  sock = makeWASocket({
+  const sock = makeWASocket({
     version,
     printQRInTerminal: true,
     auth: state,
@@ -48,36 +50,20 @@ async function connectToWhatsApp() {
     browser: ['IRIS CRM', 'Chrome', '4.0']
   })
 
-  // ==========================================================
-  // 🔍 DIAGNÓSTICO DE CONEXÃO E EVENTOS
-  // ==========================================================
-  console.log(`🟢 [${EMPRESA_ID}] Conexão Baileys estabelecida, aguardando mensagens...`)
+  console.log(`🟢 [${EMPRESA_ID}] Conexão Baileys inicializada. Aguardando status...`)
 
-  sock.ev.on('connection.update', (update) => {
-    console.log(`🔌 [${EMPRESA_ID}] Connection update:`, update)
-  })
-
-  sock.ev.on('messages.upsert', (data) => {
-    console.log(`🧩 [${EMPRESA_ID}] Evento messages.upsert recebido do Baileys:`)
-    console.log(JSON.stringify(data, null, 2))
-  })
-
-  // ============================================
-  // EVENTO DE CONEXÃO
-  // ============================================
+  // ===================================================
+  // EVENTOS DE CONEXÃO
+  // ===================================================
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
+
     if (qr) {
       console.clear()
       console.log(`📱 [${EMPRESA_ID}] Escaneie o QR Code abaixo:`)
       qrcode.generate(qr, { small: true })
     }
-    if (connection === 'close') {
-      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
-      console.log(`⚠️ [${EMPRESA_ID}] Conexão encerrada:`, reason)
-      connectionStatus.connected = false
-      if (reason !== DisconnectReason.loggedOut) connectToWhatsApp()
-    }
+
     if (connection === 'open') {
       const user = sock?.user?.id?.split(':')[0]
       console.log(`✅ [${EMPRESA_ID}] WhatsApp conectado com sucesso! Número: ${user}`)
@@ -86,27 +72,37 @@ async function connectToWhatsApp() {
         number: user,
         lastUpdate: new Date().toISOString()
       }
+
+      // Listener só inicia depois da conexão estar aberta
+      iniciarListenerMensagens(sock)
+    }
+
+    if (connection === 'close') {
+      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
+      console.log(`⚠️ [${EMPRESA_ID}] Conexão encerrada:`, reason)
+      connectionStatus.connected = false
+      if (reason !== DisconnectReason.loggedOut) connectToWhatsApp()
     }
   })
 
   sock.ev.on('creds.update', saveCreds)
+}
 
-  // ============================================
-  // 📥 LISTENER DE MENSAGENS RECEBIDAS
-  // ============================================
+// ===================================================
+// 📥 LISTENER DE MENSAGENS RECEBIDAS
+// ===================================================
+function iniciarListenerMensagens(sock) {
+  console.log(`🧠 [${EMPRESA_ID}] Listener de mensagens iniciado.`)
+
   sock.ev.on('messages.upsert', async ({ messages }) => {
-    console.log(`🔔 [${EMPRESA_ID}] messages.upsert disparado! Total de mensagens: ${messages.length}`)
+    console.log(`🔔 [${EMPRESA_ID}] Evento messages.upsert disparado! Total: ${messages.length}`)
 
     for (const msg of messages) {
-      console.log(`📋 [${EMPRESA_ID}] Processando mensagem:`, {
-        fromMe: msg.key.fromMe,
-        remoteJid: msg.key.remoteJid,
-        messageType: Object.keys(msg.message || {})[0]
-      })
+      console.log(`📋 [${EMPRESA_ID}] Mensagem recebida bruta:`, JSON.stringify(msg, null, 2))
 
       try {
         if (msg.key.fromMe) {
-          console.log(`⏭️ [${EMPRESA_ID}] Ignorando mensagem fromMe=true`)
+          console.log(`⏭️ [${EMPRESA_ID}] Ignorando mensagem enviada pelo sistema (fromMe=true)`)
           continue
         }
 
@@ -119,16 +115,14 @@ async function connectToWhatsApp() {
           msg.message?.documentMessage?.fileName ||
           ''
 
-        console.log(`📩 [${EMPRESA_ID}] Mensagem recebida de ${from}:`, messageText)
+        console.log(`📩 [${EMPRESA_ID}] Mensagem recebida de ${from}: ${messageText}`)
 
         const payload = {
-          from: from,
+          from,
           message: messageText,
           type: messageType === 'conversation' ? 'text' : messageType,
           fromMe: false
         }
-
-        console.log(`🚀 [${EMPRESA_ID}] Enviando para webhook:`, JSON.stringify(payload))
 
         const webhookResponse = await fetch(`${SUPABASE_URL}/functions/v1/baileys-webhook`, {
           method: 'POST',
@@ -140,19 +134,17 @@ async function connectToWhatsApp() {
           body: JSON.stringify(payload)
         })
 
-        const responseText = await webhookResponse.text()
-        console.log(`✅ [${EMPRESA_ID}] Webhook respondeu (${webhookResponse.status}):`, responseText)
+        console.log(`✅ [${EMPRESA_ID}] Webhook respondeu (${webhookResponse.status})`)
       } catch (err) {
         console.error(`❌ [${EMPRESA_ID}] Erro ao processar mensagem recebida:`, err.message)
-        console.error(`❌ Stack trace:`, err.stack)
       }
     }
   })
 }
 
-// ============================================
+// ===================================================
 // 📡 STATUS
-// ============================================
+// ===================================================
 app.get('/status', (req, res) => {
   res.json({
     success: true,
@@ -163,9 +155,9 @@ app.get('/status', (req, res) => {
   })
 })
 
-// ============================================
-// ✉️ ENVIO DE MENSAGEM / ÁUDIO / PDF
-// ============================================
+// ===================================================
+// ✉️ ENVIO DE MENSAGENS, ÁUDIO E PDF
+// ===================================================
 app.post('/send-message', async (req, res) => {
   try {
     const { number, message, media, fileName } = req.body
@@ -173,9 +165,9 @@ app.post('/send-message', async (req, res) => {
 
     const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
 
-    // ====================================================
+    // ===================================================
     // 🎧 ÁUDIO
-    // ====================================================
+    // ===================================================
     if (media && media.startsWith('data:audio/')) {
       console.log(`=== AUDIO DEBUG ===`)
       console.log(`[${EMPRESA_ID}] Processando envio de áudio base64...`)
@@ -239,9 +231,9 @@ app.post('/send-message', async (req, res) => {
       }
     }
 
-    // ====================================================
+    // ===================================================
     // 📎 PDF
-    // ====================================================
+    // ===================================================
     if (media && fileName) {
       const response = await fetch(media)
       const buffer = await response.arrayBuffer()
@@ -254,9 +246,9 @@ app.post('/send-message', async (req, res) => {
       return res.json({ success: true, message: 'PDF enviado com sucesso.' })
     }
 
-    // ====================================================
+    // ===================================================
     // 💬 TEXTO
-    // ====================================================
+    // ===================================================
     await sock.sendMessage(jid, { text: message })
     console.log(`[${EMPRESA_ID}] Mensagem enviada para ${jid}`)
     return res.json({ success: true, message: 'Mensagem enviada com sucesso.' })
@@ -266,9 +258,9 @@ app.post('/send-message', async (req, res) => {
   }
 })
 
-// ============================================
-// 🚀 START
-// ============================================
+// ===================================================
+// 🚀 START SERVIDOR
+// ===================================================
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 [${EMPRESA_ID}] Servidor rodando na porta ${PORT}`)
   connectToWhatsApp()
