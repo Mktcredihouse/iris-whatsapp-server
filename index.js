@@ -1,318 +1,425 @@
-import makeWASocket, {
+import makeWASocket, { 
+  DisconnectReason, 
   useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  DisconnectReason,
-  downloadMediaMessage
-} from '@whiskeysockets/baileys'
-import { createClient } from '@supabase/supabase-js'
-import P from 'pino'
-import express from 'express'
-import qrcode from 'qrcode-terminal'
-import { Boom } from '@hapi/boom'
-import fetch from 'node-fetch'
-import dotenv from 'dotenv'
+  downloadMediaMessage,
+  makeInMemoryStore
+} from '@whiskeysockets/baileys';
+import { createClient } from '@supabase/supabase-js';
+import { Boom } from '@hapi/boom';
+import express from 'express';
+import qrcode from 'qrcode-terminal';
+import fetch from 'node-fetch';
+import 'dotenv/config';
 
-dotenv.config()
+// Configurações do ambiente
+const PORT = process.env.PORT || 10000;
+const EMPRESA_ID = process.env.EMPRESA_ID || 'credihouse';
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
-// ================================
-// 🔧 CONFIGURAÇÕES GERAIS
-// ================================
-const PORT = process.env.PORT || 10000
-const EMPRESA_ID = process.env.EMPRESA_ID || 'empresa_default'
-const SUPABASE_URL = process.env.SUPABASE_URL
-const SUPABASE_KEY = process.env.SUPABASE_KEY
-const WEBHOOK_URL = process.env.WEBHOOK_URL
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
-const app = express()
-app.use(express.json())
-
-let sock = null
-let qrCodeData = null
-let connectionStatus = 'disconnected'
-let connectedNumber = null
-let lastUpdate = new Date()
-
-// ================================
-// 🔐 CONEXÃO COM WHATSAPP
-// ================================
-async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('./baileys_auth')
-  const { version } = await fetchLatestBaileysVersion()
-
-  sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    logger: P({ level: 'silent' }),
-  })
-
-  sock.ev.on('creds.update', saveCreds)
-
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update
-
-    if (qr) {
-      console.log(`📱 [${EMPRESA_ID}] QR Code gerado!`)
-      qrCodeData = qr
-      qrcode.generate(qr, { small: true })
-      
-      await supabase.from('whatsapp_connection').upsert({
-        company_id: EMPRESA_ID,
-        qr_code: qr,
-        is_connected: false,
-      }, { onConflict: 'company_id' })
-    }
-
-    if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut
-      console.log(`❌ [${EMPRESA_ID}] Conexão fechada. Reconectar?`, shouldReconnect)
-      
-      connectionStatus = 'disconnected'
-      connectedNumber = null
-      lastUpdate = new Date()
-      
-      await supabase.from('whatsapp_connection').update({
-        is_connected: false,
-        connected_number: null,
-      }).eq('company_id', EMPRESA_ID)
-
-      if (shouldReconnect) {
-        setTimeout(connectToWhatsApp, 3000)
-      }
-    } else if (connection === 'open') {
-      console.log(`✅ [${EMPRESA_ID}] Conectado ao WhatsApp!`)
-      connectionStatus = 'connected'
-      connectedNumber = sock.user?.id.split(':')[0] || null
-      lastUpdate = new Date()
-      
-      await supabase.from('whatsapp_connection').update({
-        is_connected: true,
-        connected_number: connectedNumber,
-        last_connected_at: new Date().toISOString(),
-      }).eq('company_id', EMPRESA_ID)
-    }
-  })
-
-  // ================================
-  // 🔵 LISTENER PARA STATUS DE MENSAGEM (CHECKS AZUIS)
-  // ================================
-  sock.ev.on('messages.update', async (updates) => {
-    for (const update of updates) {
-      const { key, update: status } = update
-      
-      if (status.status) {
-        const messageId = key.id
-        const readStatus = status.status.toLowerCase() // 'read', 'delivered', 'sent'
-        
-        console.log(`📱 [${EMPRESA_ID}] Status atualizado: ${messageId} -> ${readStatus}`)
-        
-        // Enviar para edge function
-        try {
-          await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-message-status`, {
-            method: 'POST',
-            headers: { 
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${SUPABASE_KEY}`
-            },
-            body: JSON.stringify({
-              messageId: messageId,
-              status: readStatus,
-              timestamp: Date.now()
-            })
-          })
-          console.log(`✅ [${EMPRESA_ID}] Status enviado para Supabase`)
-        } catch (err) {
-          console.error(`❌ [${EMPRESA_ID}] Erro ao atualizar status:`, err)
-        }
-      }
-    }
-  })
-
-  // ================================
-  // 💬 RECEBIMENTO DE MENSAGENS
-  // ================================
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue
-
-      const sender = msg.key.remoteJid
-      const senderName = msg.pushName || sender.split('@')[0]
-      
-      // 🖼️ BUSCAR FOTO DE PERFIL
-      let profilePicUrl = null
-      try {
-        profilePicUrl = await sock.profilePictureUrl(sender, 'image')
-        console.log(`🖼️ [${EMPRESA_ID}] Foto de perfil capturada para ${sender}`)
-      } catch (err) {
-        console.log(`⚠️ [${EMPRESA_ID}] Sem foto de perfil pública para ${sender}`)
-      }
-
-      let messageText = null
-      let messageType = 'text'
-      let mediaUrl = null
-
-      if (msg.message.conversation) {
-        messageText = msg.message.conversation
-      } else if (msg.message.extendedTextMessage) {
-        messageText = msg.message.extendedTextMessage.text
-      } else if (msg.message.imageMessage) {
-        messageType = 'image'
-        messageText = msg.message.imageMessage.caption || 'Imagem recebida'
-        try {
-          const buffer = await downloadMediaMessage(msg, 'buffer', {})
-          const { data, error } = await supabase.storage
-            .from('chat-files')
-            .upload(`${EMPRESA_ID}/${msg.key.id}.jpg`, buffer, {
-              contentType: 'image/jpeg',
-            })
-          if (!error) {
-            const { data: publicUrl } = supabase.storage
-              .from('chat-files')
-              .getPublicUrl(data.path)
-            mediaUrl = publicUrl.publicUrl
-          }
-        } catch (err) {
-          console.error(`❌ [${EMPRESA_ID}] Erro ao baixar imagem:`, err)
-        }
-      } else if (msg.message.audioMessage) {
-        messageType = 'audio'
-        messageText = 'Áudio recebido'
-      } else if (msg.message.videoMessage) {
-        messageType = 'video'
-        messageText = msg.message.videoMessage.caption || 'Vídeo recebido'
-      } else if (msg.message.documentMessage) {
-        messageType = 'document'
-        const fileName = msg.message.documentMessage.fileName || 'documento'
-        messageText = `Documento: ${fileName}`
-      }
-
-      console.log(`📨 [${EMPRESA_ID}] ${senderName}: ${messageText}`)
-
-      // Enviar webhook
-      if (WEBHOOK_URL) {
-        try {
-          const webhookPayload = {
-            from: sender,
-            to: sock.user?.id.split('@')[0] || 'unknown',
-            message: messageText,
-            name: senderName,
-            profilePicUrl: profilePicUrl, // 🖼️ INCLUIR FOTO
-            type: messageType,
-            media: mediaUrl,
-            fromMe: false,
-            companyId: EMPRESA_ID
-          }
-
-          await fetch(WEBHOOK_URL, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Company-ID': EMPRESA_ID,
-              'X-Webhook-Secret': WEBHOOK_SECRET,
-            },
-            body: JSON.stringify(webhookPayload),
-          })
-
-          console.log(`✅ [${EMPRESA_ID}] Webhook enviado`)
-        } catch (err) {
-          console.error(`❌ [${EMPRESA_ID}] Erro ao enviar webhook:`, err)
-        }
-      }
-    }
-  })
+// Validar variáveis obrigatórias
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('❌ ERRO: SUPABASE_URL e SUPABASE_KEY são obrigatórios no .env');
+  process.exit(1);
 }
 
-// ================================
-// 📡 ENDPOINT STATUS
-// ================================
+console.log('✅ Variáveis de ambiente carregadas');
+
+// Inicializar Supabase
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+console.log('✅ Supabase inicializado corretamente');
+
+// Inicializar Express
+const app = express();
+app.use(express.json());
+
+// Estado global da conexão
+let sock;
+let connectionStatus = {
+  connected: false,
+  number: null,
+  lastUpdate: null,
+  qrCode: null
+};
+
+// Conectar ao WhatsApp
+async function connectToWhatsApp() {
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    
+    sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      logger: { level: 'silent' }
+    });
+
+    // Evento: atualização de conexão
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        console.log('📱 Gerando QR Code...');
+        qrcode.generate(qr, { small: true });
+        connectionStatus.qrCode = qr;
+        connectionStatus.lastUpdate = new Date().toISOString();
+
+        // Salvar QR no Supabase
+        await supabase
+          .from('whatsapp_connection')
+          .upsert({
+            company_id: EMPRESA_ID,
+            qr_code: qr,
+            status: 'pending',
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'company_id' });
+      }
+
+      if (connection === 'close') {
+        const shouldReconnect = 
+          (lastDisconnect?.error instanceof Boom) &&
+          lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut;
+
+        console.log('❌ Conexão fechada. Reconectar?', shouldReconnect);
+
+        if (shouldReconnect) {
+          setTimeout(() => connectToWhatsApp(), 3000);
+        }
+
+        connectionStatus.connected = false;
+        connectionStatus.number = null;
+        connectionStatus.lastUpdate = new Date().toISOString();
+
+        await supabase
+          .from('whatsapp_connection')
+          .update({
+            status: 'disconnected',
+            phone_number: null,
+            updated_at: new Date().toISOString()
+          })
+          .eq('company_id', EMPRESA_ID);
+      }
+
+      if (connection === 'open') {
+        console.log('✅ Conectado ao WhatsApp!');
+        const phoneNumber = sock.user.id.split(':')[0];
+        console.log(`📱 Número: +${phoneNumber}`);
+
+        connectionStatus.connected = true;
+        connectionStatus.number = phoneNumber;
+        connectionStatus.qrCode = null;
+        connectionStatus.lastUpdate = new Date().toISOString();
+
+        await supabase
+          .from('whatsapp_connection')
+          .upsert({
+            company_id: EMPRESA_ID,
+            phone_number: phoneNumber,
+            status: 'connected',
+            qr_code: null,
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'company_id' });
+      }
+    });
+
+    // Evento: credenciais atualizadas
+    sock.ev.on('creds.update', saveCreds);
+
+    // Evento: atualização de status de mensagens (CHECKS AZUIS)
+    sock.ev.on('messages.update', async (updates) => {
+      for (const update of updates) {
+        try {
+          const { key, update: status } = update;
+          
+          if (status?.status) {
+            const messageId = key.id;
+            const readStatus = status.status.toString().toLowerCase();
+            
+            console.log(`📊 Status atualizado - ID: ${messageId}, Status: ${readStatus}`);
+
+            // Chamar edge function para atualizar no banco
+            const response = await fetch(
+              `${SUPABASE_URL}/functions/v1/whatsapp-message-status`,
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${SUPABASE_KEY}`
+                },
+                body: JSON.stringify({
+                  messageId,
+                  status: readStatus,
+                  timestamp: Date.now()
+                })
+              }
+            );
+
+            if (response.ok) {
+              console.log(`✅ Status salvo no banco: ${messageId} -> ${readStatus}`);
+            } else {
+              const error = await response.text();
+              console.error(`❌ Erro ao salvar status: ${error}`);
+            }
+          }
+        } catch (error) {
+          console.error('❌ Erro ao processar messages.update:', error);
+        }
+      }
+    });
+
+    // Evento: novas mensagens recebidas
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+
+      for (const message of messages) {
+        try {
+          if (message.key.fromMe) continue;
+
+          const sender = message.key.remoteJid;
+          const messageType = Object.keys(message.message || {})[0];
+          
+          console.log(`📩 Mensagem recebida de ${sender} - Tipo: ${messageType}`);
+
+          let messageText = '';
+          let mediaUrl = null;
+          let mediaType = null;
+
+          // Processar diferentes tipos de mensagem
+          if (messageType === 'conversation') {
+            messageText = message.message.conversation;
+          } else if (messageType === 'extendedTextMessage') {
+            messageText = message.message.extendedTextMessage.text;
+          } else if (messageType === 'imageMessage') {
+            mediaType = 'image';
+            const buffer = await downloadMediaMessage(message, 'buffer', {});
+            const fileName = `${Date.now()}.jpg`;
+            
+            const { data: uploadData, error: uploadError } = await supabase.storage
+              .from('chat-files')
+              .upload(fileName, buffer, { contentType: 'image/jpeg' });
+
+            if (!uploadError) {
+              const { data: { publicUrl } } = supabase.storage
+                .from('chat-files')
+                .getPublicUrl(fileName);
+              mediaUrl = publicUrl;
+            }
+
+            messageText = message.message.imageMessage.caption || '[Imagem]';
+          } else if (messageType === 'audioMessage') {
+            mediaType = 'audio';
+            const buffer = await downloadMediaMessage(message, 'buffer', {});
+            const fileName = `${Date.now()}.ogg`;
+            
+            const { data: uploadData, error: uploadError } = await supabase.storage
+              .from('chat-files')
+              .upload(fileName, buffer, { contentType: 'audio/ogg' });
+
+            if (!uploadError) {
+              const { data: { publicUrl } } = supabase.storage
+                .from('chat-files')
+                .getPublicUrl(fileName);
+              mediaUrl = publicUrl;
+            }
+
+            messageText = '[Áudio]';
+          } else if (messageType === 'videoMessage') {
+            mediaType = 'video';
+            const buffer = await downloadMediaMessage(message, 'buffer', {});
+            const fileName = `${Date.now()}.mp4`;
+            
+            const { data: uploadData, error: uploadError } = await supabase.storage
+              .from('chat-files')
+              .upload(fileName, buffer, { contentType: 'video/mp4' });
+
+            if (!uploadError) {
+              const { data: { publicUrl } } = supabase.storage
+                .from('chat-files')
+                .getPublicUrl(fileName);
+              mediaUrl = publicUrl;
+            }
+
+            messageText = message.message.videoMessage.caption || '[Vídeo]';
+          } else if (messageType === 'documentMessage') {
+            mediaType = 'document';
+            messageText = message.message.documentMessage.fileName || '[Documento]';
+          }
+
+          // Capturar foto de perfil do contato
+          let profilePicUrl = null;
+          try {
+            profilePicUrl = await sock.profilePictureUrl(sender, 'image');
+            console.log(`🖼️ Foto de perfil capturada para ${sender}`);
+          } catch (err) {
+            console.log(`⚠️ Sem foto de perfil pública para ${sender}`);
+          }
+
+          // Enviar para webhook
+          if (WEBHOOK_URL) {
+            const webhookPayload = {
+              companyId: EMPRESA_ID,
+              from: sender,
+              message: messageText,
+              timestamp: message.messageTimestamp,
+              messageType,
+              mediaUrl,
+              mediaType,
+              profilePicUrl,
+              pushName: message.pushName || 'Desconhecido'
+            };
+
+            console.log('📤 Enviando para webhook:', WEBHOOK_URL);
+
+            const response = await fetch(WEBHOOK_URL, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-company-id': EMPRESA_ID,
+                ...(WEBHOOK_SECRET && { 'x-webhook-secret': WEBHOOK_SECRET })
+              },
+              body: JSON.stringify(webhookPayload)
+            });
+
+            if (response.ok) {
+              console.log('✅ Webhook enviado com sucesso');
+            } else {
+              console.error('❌ Erro no webhook:', await response.text());
+            }
+          }
+
+        } catch (error) {
+          console.error('❌ Erro ao processar mensagem:', error);
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Erro ao conectar:', error);
+    setTimeout(() => connectToWhatsApp(), 5000);
+  }
+}
+
+// Endpoint: verificar status
 app.get('/status', (req, res) => {
   res.json({
-    status: connectionStatus,
-    connected: connectionStatus === 'connected',
-    number: connectedNumber,
-    lastUpdate: lastUpdate,
-  })
-})
+    connected: connectionStatus.connected,
+    number: connectionStatus.number,
+    lastUpdate: connectionStatus.lastUpdate,
+    hasQR: !!connectionStatus.qrCode
+  });
+});
 
-// ================================
-// ✉️ ENDPOINT ENVIO DE MENSAGEM
-// ================================
+// Endpoint: enviar mensagem
 app.post('/send-message', async (req, res) => {
   try {
-    const { number, message, media, fileName } = req.body
-
-    if (!number || (!message && !media)) {
-      return res.status(400).json({ error: 'Número e mensagem/mídia são obrigatórios' })
+    if (!connectionStatus.connected) {
+      return res.status(503).json({ 
+        success: false, 
+        error: 'WhatsApp não conectado' 
+      });
     }
 
-    let formattedNumber = number
-    if (!formattedNumber.includes('@')) {
-      formattedNumber = `${formattedNumber}@s.whatsapp.net`
+    const { phone, message, mediaUrl, mediaType } = req.body;
+
+    if (!phone || (!message && !mediaUrl)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Telefone e mensagem/mídia são obrigatórios' 
+      });
     }
 
-    let sentMsg
+    const formattedPhone = phone.includes('@s.whatsapp.net') 
+      ? phone 
+      : `${phone.replace(/\D/g, '')}@s.whatsapp.net`;
 
-    if (media) {
-      const mediaBuffer = Buffer.from(media.split(',')[1] || media, 'base64')
+    let sentMsg;
+
+    if (mediaUrl) {
+      // Enviar mídia
+      const mediaBuffer = await fetch(mediaUrl).then(r => r.buffer());
       
-      if (fileName) {
-        sentMsg = await sock.sendMessage(formattedNumber, {
-          document: mediaBuffer,
-          fileName: fileName,
-          caption: message || '',
-        })
-      } else {
-        sentMsg = await sock.sendMessage(formattedNumber, {
+      if (mediaType === 'image') {
+        sentMsg = await sock.sendMessage(formattedPhone, {
           image: mediaBuffer,
-          caption: message || '',
-        })
+          caption: message || ''
+        });
+      } else if (mediaType === 'video') {
+        sentMsg = await sock.sendMessage(formattedPhone, {
+          video: mediaBuffer,
+          caption: message || ''
+        });
+      } else if (mediaType === 'audio') {
+        sentMsg = await sock.sendMessage(formattedPhone, {
+          audio: mediaBuffer,
+          mimetype: 'audio/ogg; codecs=opus',
+          ptt: true
+        });
+      } else if (mediaType === 'document') {
+        sentMsg = await sock.sendMessage(formattedPhone, {
+          document: mediaBuffer,
+          fileName: message || 'document.pdf'
+        });
       }
     } else {
-      sentMsg = await sock.sendMessage(formattedNumber, {
-        text: message,
-      })
+      // Enviar texto
+      sentMsg = await sock.sendMessage(formattedPhone, { text: message });
     }
 
-    console.log(`✅ [${EMPRESA_ID}] Mensagem enviada para ${number}`)
-    
+    console.log('✅ Mensagem enviada:', sentMsg.key.id);
+
     res.status(200).json({ 
       success: true, 
-      message: "Mensagem enviada com sucesso.",
-      messageId: sentMsg.key.id,  // 🔵 RETORNAR MESSAGE ID
-      key: sentMsg.key              // 🔵 RETORNAR KEY COMPLETA
-    })
-  } catch (error) {
-    console.error(`❌ [${EMPRESA_ID}] Erro ao enviar mensagem:`, error)
-    res.status(500).json({ error: error.message })
-  }
-})
+      message: 'Mensagem enviada com sucesso',
+      messageId: sentMsg.key.id,  // ID da mensagem do Baileys
+      key: sentMsg.key             // Chave completa da mensagem
+    });
 
-// ================================
-// 🚪 ENDPOINT LOGOUT
-// ================================
+  } catch (error) {
+    console.error('❌ Erro ao enviar mensagem:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// Endpoint: logout
 app.get('/logout', async (req, res) => {
   try {
-    await sock.logout()
-    connectionStatus = 'disconnected'
-    connectedNumber = null
-    
-    await supabase.from('whatsapp_connection').update({
-      is_connected: false,
-      connected_number: null,
-    }).eq('company_id', EMPRESA_ID)
+    if (sock) {
+      await sock.logout();
+      console.log('✅ Logout realizado');
 
-    res.json({ success: true, message: 'Desconectado com sucesso' })
+      connectionStatus = {
+        connected: false,
+        number: null,
+        lastUpdate: new Date().toISOString(),
+        qrCode: null
+      };
+
+      await supabase
+        .from('whatsapp_connection')
+        .update({
+          status: 'disconnected',
+          phone_number: null,
+          qr_code: null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('company_id', EMPRESA_ID);
+
+      res.json({ success: true, message: 'Logout realizado com sucesso' });
+    } else {
+      res.status(400).json({ success: false, error: 'Nenhuma sessão ativa' });
+    }
   } catch (error) {
-    res.status(500).json({ error: error.message })
+    console.error('❌ Erro no logout:', error);
+    res.status(500).json({ success: false, error: error.message });
   }
-})
+});
 
-// ================================
-// 🚀 INICIALIZA SERVIDOR
-// ================================
+// Iniciar servidor
 app.listen(PORT, () => {
-  console.log(`🚀 [${EMPRESA_ID}] Servidor rodando na porta ${PORT}`)
-  connectToWhatsApp()
-})
+  console.log(`🚀 [${EMPRESA_ID}] Servidor rodando na porta ${PORT}`);
+  connectToWhatsApp();
+});
