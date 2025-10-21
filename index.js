@@ -81,6 +81,46 @@ async function connectToWhatsApp() {
   })
 
   // ================================
+  // 📱 LISTENER DE STATUS DE MENSAGEM (✨ NOVO - CHECK AZUL)
+  // ================================
+  sock.ev.on('messages.update', async (updates) => {
+    for (const update of updates) {
+      const { key, update: status } = update
+      
+      if (status.status) {
+        const messageId = key.id
+        const readStatus = status.status.toLowerCase() // 'read', 'delivered', 'sent'
+        
+        console.log(`📱 [${EMPRESA_ID}] Status atualizado: ${messageId} -> ${readStatus}`)
+        
+        // Enviar para edge function
+        try {
+          const response = await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-message-status`, {
+            method: 'POST',
+            headers: { 
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
+            },
+            body: JSON.stringify({
+              messageId: messageId,
+              status: readStatus,
+              timestamp: Date.now()
+            })
+          })
+          
+          if (response.ok) {
+            console.log(`✅ [${EMPRESA_ID}] Status da mensagem atualizado no sistema`)
+          } else {
+            console.error(`⚠️ [${EMPRESA_ID}] Erro ao atualizar status: ${response.status}`)
+          }
+        } catch (err) {
+          console.error(`❌ [${EMPRESA_ID}] Erro ao enviar atualização de status:`, err.message)
+        }
+      }
+    }
+  })
+
+  // ================================
   // 💬 RECEBIMENTO DE MENSAGENS
   // ================================
   sock.ev.on('messages.upsert', async ({ messages }) => {
@@ -97,19 +137,22 @@ async function connectToWhatsApp() {
 
     const sender = msg.key.remoteJid
     const pushName = msg.pushName || 'Cliente'
-    let content = ''
-    let type = 'text'
-    let mediaBase64 = null
-
-    // 🖼️ BUSCAR FOTO DE PERFIL
+    
+    // ================================
+    // 🖼️ BUSCAR FOTO DE PERFIL (✨ NOVO)
+    // ================================
     let profilePicUrl = null
     try {
       profilePicUrl = await sock.profilePictureUrl(sender, 'image')
       console.log(`🖼️ [${EMPRESA_ID}] Foto de perfil capturada para ${sender}`)
     } catch (err) {
-      console.log(`⚠️ [${EMPRESA_ID}] Sem foto pública para ${sender}`)
+      console.log(`⚠️ [${EMPRESA_ID}] Sem foto de perfil pública para ${sender}`)
       // Não é erro crítico, alguns contatos não têm foto pública
     }
+
+    let content = ''
+    let type = 'text'
+    let mediaBase64 = null
 
     try {
       if (msg.message.conversation) {
@@ -151,7 +194,7 @@ async function connectToWhatsApp() {
         to: connectionStatus.number,           // ✅ Número da IRIS (quem recebeu)
         message: content,
         name: pushName,
-        profilePicUrl: profilePicUrl,          // ✅ FOTO DE PERFIL
+        profilePicUrl: profilePicUrl,          // ✅ NOVO CAMPO
         type,
         media: mediaBase64,
         fromMe: false                          // ✅ Explicitamente FALSE
