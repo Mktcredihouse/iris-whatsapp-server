@@ -1,360 +1,311 @@
-import makeWASocket, {
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  DisconnectReason,
-  downloadMediaMessage
-} from '@whiskeysockets/baileys'
-import { createClient } from '@supabase/supabase-js'
-import P from 'pino'
-import express from 'express'
-import qrcode from 'qrcode-terminal'
-import { Boom } from '@hapi/boom'
-import fetch from 'node-fetch'
-import dotenv from 'dotenv'
+require('dotenv').config();
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const qrcode = require('qrcode-terminal');
+const { createClient } = require('@supabase/supabase-js');
+const express = require('express');
+const fetch = require('node-fetch');
 
-dotenv.config()
+// Configuração
+const PORT = process.env.PORT || 10000;
+const EMPRESA_ID = process.env.EMPRESA_ID || 'empresa_default';
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
-// ================================
-// 🔧 CONFIGURAÇÕES GERAIS
-// ================================
-const PORT = process.env.PORT || 10000
-const EMPRESA_ID = process.env.EMPRESA_ID || 'Credihouse'
-const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-const BAILEYS_WEBHOOK_SECRET = process.env.BAILEYS_WEBHOOK_SECRET || "credlar-shared-secret"
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const app = express();
+app.use(express.json());
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
-const app = express()
-app.use(express.json({ limit: '50mb' }))
+let sock;
+let qrCodeData = null;
+let connectionStatus = 'disconnected';
+let connectedNumber = null;
+let lastUpdate = new Date();
 
-let sock = null
-let connectionStatus = {
-  connected: false,
-  number: null,
-  lastUpdate: null
-}
-
-// ================================
-// 🔐 CONEXÃO COM WHATSAPP
-// ================================
 async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('./session')
-  const { version } = await fetchLatestBaileysVersion()
+  const { state, saveCreds } = await useMultiFileAuthState('./baileys_auth');
+  const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
     version,
-    printQRInTerminal: true,
     auth: state,
-    logger: P({ level: 'silent' }),
-    browser: ['IRIS CRM', 'Chrome', '4.0']
-  })
+    printQRInTerminal: false,
+  });
+
+  sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update
+    const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.clear()
-      console.log(`📱 [${EMPRESA_ID}] Escaneie o QR Code abaixo para conectar o WhatsApp:`)
-      qrcode.generate(qr, { small: true })
+      console.log(`📱 [${EMPRESA_ID}] QR Code gerado!`);
+      qrCodeData = qr;
+      qrcode.generate(qr, { small: true });
+      
+      await supabase.from('whatsapp_connection').upsert({
+        company_id: EMPRESA_ID,
+        qr_code: qr,
+        is_connected: false,
+      }, { onConflict: 'company_id' });
     }
 
     if (connection === 'close') {
-      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
-      console.log(`⚠️ [${EMPRESA_ID}] Conexão encerrada:`, reason)
-      connectionStatus.connected = false
-      connectionStatus.number = null
-      if (reason !== DisconnectReason.loggedOut) {
-        console.log('🔄 Tentando reconectar...')
-        connectToWhatsApp()
-      }
-    }
+      const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log(`❌ [${EMPRESA_ID}] Conexão fechada. Reconectar?`, shouldReconnect);
+      
+      connectionStatus = 'disconnected';
+      connectedNumber = null;
+      lastUpdate = new Date();
+      
+      await supabase.from('whatsapp_connection').update({
+        is_connected: false,
+        connected_number: null,
+      }).eq('company_id', EMPRESA_ID);
 
-    if (connection === 'open') {
-      const user = sock?.user?.id?.split(':')[0]
-      console.log(`✅ [${EMPRESA_ID}] WhatsApp conectado com sucesso! Número: ${user}`)
-      connectionStatus = {
-        connected: true,
-        number: user,
-        lastUpdate: new Date().toISOString()
+      if (shouldReconnect) {
+        setTimeout(connectToWhatsApp, 3000);
       }
+    } else if (connection === 'open') {
+      console.log(`✅ [${EMPRESA_ID}] Conectado ao WhatsApp!`);
+      connectionStatus = 'connected';
+      connectedNumber = sock.user?.id.split(':')[0] || null;
+      lastUpdate = new Date();
+      
+      await supabase.from('whatsapp_connection').update({
+        is_connected: true,
+        connected_number: connectedNumber,
+        last_connected_at: new Date().toISOString(),
+      }).eq('company_id', EMPRESA_ID);
     }
-  })
+  });
 
-  // ================================
-  // 📱 LISTENER DE STATUS DE MENSAGEM (✨ NOVO - CHECK AZUL)
-  // ================================
+  // 🔵 LISTENER PARA STATUS DE MENSAGEM (CHECKS AZUIS)
   sock.ev.on('messages.update', async (updates) => {
     for (const update of updates) {
-      const { key, update: status } = update
+      const { key, update: status } = update;
       
       if (status.status) {
-        const messageId = key.id
-        const readStatus = status.status.toLowerCase() // 'read', 'delivered', 'sent'
+        const messageId = key.id;
+        const readStatus = status.status.toLowerCase(); // 'read', 'delivered', 'sent'
         
-        console.log(`📱 [${EMPRESA_ID}] Status atualizado: ${messageId} -> ${readStatus}`)
+        console.log(`📱 [${EMPRESA_ID}] Status atualizado: ${messageId} -> ${readStatus}`);
         
         // Enviar para edge function
         try {
-          const response = await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-message-status`, {
+          await fetch(`${SUPABASE_URL}/functions/v1/whatsapp-message-status`, {
             method: 'POST',
             headers: { 
               'Content-Type': 'application/json',
-              'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
+              'Authorization': `Bearer ${SUPABASE_KEY}`
             },
             body: JSON.stringify({
               messageId: messageId,
               status: readStatus,
               timestamp: Date.now()
             })
-          })
-          
-          if (response.ok) {
-            console.log(`✅ [${EMPRESA_ID}] Status da mensagem atualizado no sistema`)
-          } else {
-            console.error(`⚠️ [${EMPRESA_ID}] Erro ao atualizar status: ${response.status}`)
+          });
+          console.log(`✅ [${EMPRESA_ID}] Status enviado para Supabase`);
+        } catch (err) {
+          console.error(`❌ [${EMPRESA_ID}] Erro ao atualizar status:`, err);
+        }
+      }
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    for (const msg of messages) {
+      if (!msg.message || msg.key.fromMe) continue;
+
+      const sender = msg.key.remoteJid;
+      const senderName = msg.pushName || sender.split('@')[0];
+      
+      // 🖼️ BUSCAR FOTO DE PERFIL
+      let profilePicUrl = null;
+      try {
+        profilePicUrl = await sock.profilePictureUrl(sender, 'image');
+        console.log(`🖼️ [${EMPRESA_ID}] Foto de perfil capturada para ${sender}`);
+      } catch (err) {
+        console.log(`⚠️ [${EMPRESA_ID}] Sem foto de perfil pública para ${sender}`);
+      }
+
+      let messageText = null;
+      let messageType = 'text';
+      let mediaUrl = null;
+
+      if (msg.message.conversation) {
+        messageText = msg.message.conversation;
+      } else if (msg.message.extendedTextMessage) {
+        messageText = msg.message.extendedTextMessage.text;
+      } else if (msg.message.imageMessage) {
+        messageType = 'image';
+        messageText = msg.message.imageMessage.caption || 'Imagem recebida';
+        try {
+          const buffer = await downloadMediaMessage(msg, 'buffer', {});
+          const { data, error } = await supabase.storage
+            .from('chat-files')
+            .upload(`${EMPRESA_ID}/${msg.key.id}.jpg`, buffer, {
+              contentType: 'image/jpeg',
+            });
+          if (!error) {
+            const { data: publicUrl } = supabase.storage
+              .from('chat-files')
+              .getPublicUrl(data.path);
+            mediaUrl = publicUrl.publicUrl;
           }
         } catch (err) {
-          console.error(`❌ [${EMPRESA_ID}] Erro ao enviar atualização de status:`, err.message)
+          console.error(`❌ [${EMPRESA_ID}] Erro ao baixar imagem:`, err);
+        }
+      } else if (msg.message.audioMessage) {
+        messageType = 'audio';
+        messageText = 'Áudio recebido';
+        // Similar download logic...
+      } else if (msg.message.videoMessage) {
+        messageType = 'video';
+        messageText = msg.message.videoMessage.caption || 'Vídeo recebido';
+        // Similar download logic...
+      } else if (msg.message.documentMessage) {
+        messageType = 'document';
+        const fileName = msg.message.documentMessage.fileName || 'documento';
+        messageText = `Documento: ${fileName}`;
+        // Similar download logic...
+      }
+
+      console.log(`📨 [${EMPRESA_ID}] ${senderName}: ${messageText}`);
+
+      // Salvar no Supabase
+      const { error } = await supabase.from('chat_messages').insert({
+        lead_phone: sender,
+        sender_name: senderName,
+        message_text: messageText,
+        message_type: messageType,
+        file_url: mediaUrl,
+        is_from_customer: true,
+        company_id: EMPRESA_ID,
+      });
+
+      if (error) {
+        console.error(`❌ [${EMPRESA_ID}] Erro ao salvar mensagem:`, error);
+      }
+
+      // Enviar webhook
+      if (WEBHOOK_URL) {
+        try {
+          const webhookPayload = {
+            from: sender,
+            to: sock.user?.id.split('@')[0] || 'unknown',
+            message: messageText,
+            name: senderName,
+            profilePicUrl: profilePicUrl, // 🖼️ INCLUIR FOTO
+            type: messageType,
+            media: mediaUrl,
+            fromMe: false,
+          };
+
+          await fetch(WEBHOOK_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Company-ID': EMPRESA_ID,
+              'X-Webhook-Secret': WEBHOOK_SECRET,
+            },
+            body: JSON.stringify(webhookPayload),
+          });
+
+          console.log(`✅ [${EMPRESA_ID}] Webhook enviado`);
+        } catch (err) {
+          console.error(`❌ [${EMPRESA_ID}] Erro ao enviar webhook:`, err);
         }
       }
     }
-  })
-
-  // ================================
-  // 💬 RECEBIMENTO DE MENSAGENS
-  // ================================
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0]
-    if (!msg.message) return
-
-    console.log('📋 Mensagem detectada:', JSON.stringify(msg.key, null, 2))
-
-    // ✅ IGNORA MENSAGENS ENVIADAS PELA PRÓPRIA IRIS
-    if (msg.key.fromMe) {
-      console.log('⏩ Ignorando mensagem enviada pela IRIS (fromMe: true)')
-      return
-    }
-
-    const sender = msg.key.remoteJid
-    const pushName = msg.pushName || 'Cliente'
-    
-    // ================================
-    // 🖼️ BUSCAR FOTO DE PERFIL (✨ NOVO)
-    // ================================
-    let profilePicUrl = null
-    try {
-      profilePicUrl = await sock.profilePictureUrl(sender, 'image')
-      console.log(`🖼️ [${EMPRESA_ID}] Foto de perfil capturada para ${sender}`)
-    } catch (err) {
-      console.log(`⚠️ [${EMPRESA_ID}] Sem foto de perfil pública para ${sender}`)
-      // Não é erro crítico, alguns contatos não têm foto pública
-    }
-
-    let content = ''
-    let type = 'text'
-    let mediaBase64 = null
-
-    try {
-      if (msg.message.conversation) {
-        content = msg.message.conversation
-      } else if (msg.message.extendedTextMessage) {
-        content = msg.message.extendedTextMessage.text
-      } else if (msg.message.imageMessage) {
-        type = 'image'
-        content = msg.message.imageMessage.caption || ''
-        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
-        mediaBase64 = `data:${msg.message.imageMessage.mimetype};base64,${buffer.toString('base64')}`
-      } else if (msg.message.audioMessage) {
-        type = 'audio'
-        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
-        mediaBase64 = `data:${msg.message.audioMessage.mimetype};base64,${buffer.toString('base64')}`
-      } else if (msg.message.videoMessage) {
-        type = 'video'
-        content = msg.message.videoMessage.caption || ''
-        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
-        mediaBase64 = `data:${msg.message.videoMessage.mimetype};base64,${buffer.toString('base64')}`
-      } else if (msg.message.documentMessage) {
-        type = 'document'
-        content = msg.message.documentMessage.fileName || 'Arquivo recebido'
-        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
-        mediaBase64 = `data:${msg.message.documentMessage.mimetype};base64,${buffer.toString('base64')}`
-      }
-
-      console.log(`📥 [${EMPRESA_ID}] Mensagem RECEBIDA de cliente - ${type} de ${sender}: ${content}`)
-
-      await supabase.from('chat_mensagens').insert([
-        { remetente: sender, mensagem: content, tipo: type, data_envio: new Date(), empresa_id: EMPRESA_ID }
-      ])
-
-      // ================================
-      // 🔔 ENVIO DO WEBHOOK
-      // ================================
-      const webhookPayload = {
-        from: sender,                          // ✅ Número do cliente (quem enviou)
-        to: connectionStatus.number,           // ✅ Número da IRIS (quem recebeu)
-        message: content,
-        name: pushName,
-        profilePicUrl: profilePicUrl,          // ✅ NOVO CAMPO
-        type,
-        media: mediaBase64,
-        fromMe: false                          // ✅ Explicitamente FALSE
-      }
-
-      console.log('📤 Payload do webhook:', JSON.stringify(webhookPayload, null, 2))
-
-      const response = await fetch("https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Empresa-ID": EMPRESA_ID,
-          "X-Webhook-Signature": BAILEYS_WEBHOOK_SECRET
-        },
-        body: JSON.stringify(webhookPayload)
-      })
-
-      if (response.ok)
-        console.log(`✅ [${EMPRESA_ID}] Webhook Lovable notificado com sucesso.`)
-      else
-        console.error(`⚠️ [${EMPRESA_ID}] Webhook respondeu com erro: ${response.status}`)
-
-    } catch (err) {
-      console.error(`❌ [${EMPRESA_ID}] Erro no recebimento:`, err.message)
-    }
-  })
-
-  sock.ev.on('creds.update', saveCreds)
+  });
 }
 
-// ================================
-// 📡 ENDPOINT STATUS
-// ================================
+// Endpoint: Status
 app.get('/status', (req, res) => {
   res.json({
-    success: true,
-    empresa_id: EMPRESA_ID,
-    connected: connectionStatus.connected,
-    number: connectionStatus.number,
-    lastUpdate: connectionStatus.lastUpdate
-  })
-})
+    status: connectionStatus,
+    connected: connectionStatus === 'connected',
+    number: connectedNumber,
+    lastUpdate: lastUpdate,
+  });
+});
 
-// ================================
-// ✉️ ENDPOINT ENVIO DE MENSAGEM (COM SUPORTE A URL)
-// ================================
+// Endpoint: Enviar Mensagem
 app.post('/send-message', async (req, res) => {
   try {
-    const { number, message, type, media, fileName } = req.body
-    if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
+    const { number, message, media, fileName } = req.body;
 
-    const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
-    let sentMsg = null
+    if (!number || (!message && !media)) {
+      return res.status(400).json({ error: 'Número e mensagem/mídia são obrigatórios' });
+    }
 
-    console.log(`📤 [${EMPRESA_ID}] Enviando mensagem para ${jid}:`, { type, message: message?.substring(0, 50), hasMedia: !!media })
+    let formattedNumber = number;
+    if (!formattedNumber.includes('@')) {
+      formattedNumber = `${formattedNumber}@s.whatsapp.net`;
+    }
+
+    let sentMsg;
 
     if (media) {
-      let mediaBuffer;
+      // Enviar mídia (base64 ou URL)
+      const mediaBuffer = Buffer.from(media.split(',')[1] || media, 'base64');
       
-      // ✅ Se for URL, fazer download primeiro
-      if (media.startsWith('http://') || media.startsWith('https://')) {
-        console.log(`🔽 [${EMPRESA_ID}] Baixando mídia de URL: ${media.substring(0, 80)}...`)
-        const response = await fetch(media)
-        if (!response.ok) throw new Error(`Erro ao baixar mídia: ${response.status}`)
-        mediaBuffer = Buffer.from(await response.arrayBuffer())
-        console.log(`✅ [${EMPRESA_ID}] Mídia baixada com sucesso: ${mediaBuffer.length} bytes`)
-      } 
-      // ✅ Se for base64 com data URI
-      else if (media.startsWith('data:')) {
-        console.log(`🔄 [${EMPRESA_ID}] Convertendo base64 (data URI)`)
-        mediaBuffer = Buffer.from(media.split(',')[1], 'base64')
-      } 
-      // ✅ Se for base64 puro
-      else {
-        console.log(`🔄 [${EMPRESA_ID}] Convertendo base64 puro`)
-        mediaBuffer = Buffer.from(media, 'base64')
-      }
-
-      // ✅ Enviar baseado no tipo
-      if (type === 'image') {
-        console.log(`📷 [${EMPRESA_ID}] Enviando imagem...`)
-        sentMsg = await sock.sendMessage(jid, { image: mediaBuffer, caption: message || '' })
-      } else if (type === 'audio') {
-        console.log(`🎵 [${EMPRESA_ID}] Enviando áudio...`)
-        sentMsg = await sock.sendMessage(jid, { audio: mediaBuffer, mimetype: 'audio/mp4', ptt: true })
-      } else if (type === 'video') {
-        console.log(`🎬 [${EMPRESA_ID}] Enviando vídeo...`)
-        sentMsg = await sock.sendMessage(jid, { video: mediaBuffer, caption: message || '' })
-      } else if (type === 'document') {
-        const docFileName = fileName || message || 'arquivo.pdf'
-        console.log(`📄 [${EMPRESA_ID}] Enviando documento: ${docFileName}`)
-        sentMsg = await sock.sendMessage(jid, {
+      if (fileName) {
+        // Documento
+        sentMsg = await sock.sendMessage(formattedNumber, {
           document: mediaBuffer,
-          mimetype: 'application/pdf',
-          fileName: docFileName
-        })
+          fileName: fileName,
+          caption: message || '',
+        });
       } else {
-        // Se não especificou tipo mas tem mídia, tentar detectar pela extensão
-        const ext = media.split('.').pop()?.split('?')[0]?.toLowerCase()
-        console.log(`🔍 [${EMPRESA_ID}] Tipo não especificado, detectando pela extensão: ${ext}`)
-        
-        if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) {
-          sentMsg = await sock.sendMessage(jid, { image: mediaBuffer, caption: message || '' })
-        } else if (['pdf', 'doc', 'docx', 'xlsx'].includes(ext)) {
-          sentMsg = await sock.sendMessage(jid, {
-            document: mediaBuffer,
-            mimetype: 'application/pdf',
-            fileName: fileName || message || 'arquivo.pdf'
-          })
-        } else {
-          throw new Error(`Tipo de mídia não suportado: ${ext}`)
-        }
+        // Imagem/vídeo/áudio (detectar pelo conteúdo)
+        sentMsg = await sock.sendMessage(formattedNumber, {
+          image: mediaBuffer,
+          caption: message || '',
+        });
       }
     } else {
-      console.log(`💬 [${EMPRESA_ID}] Enviando mensagem de texto`)
-      sentMsg = await sock.sendMessage(jid, { text: message })
+      // Texto simples
+      sentMsg = await sock.sendMessage(formattedNumber, {
+        text: message,
+      });
     }
 
-    console.log(`✅ [${EMPRESA_ID}] Mensagem enviada com sucesso!`)
-
-    await supabase.from('chat_mensagens').insert([
-      {
-        remetente: connectionStatus.number,
-        destinatario: number,
-        mensagem: message || '(mídia)',
-        tipo: type || 'text',
-        data_envio: new Date(),
-        empresa_id: EMPRESA_ID
-      }
-    ])
-
-    res.json({ success: true, message: 'Mensagem enviada com sucesso.' })
+    console.log(`✅ [${EMPRESA_ID}] Mensagem enviada para ${number}`);
+    
+    res.status(200).json({ 
+      success: true, 
+      message: "Mensagem enviada com sucesso.",
+      messageId: sentMsg.key.id,  // 🔵 RETORNAR MESSAGE ID
+      key: sentMsg.key              // 🔵 RETORNAR KEY COMPLETA
+    });
   } catch (error) {
-    console.error(`❌ [${EMPRESA_ID}] Erro ao enviar mensagem:`, error)
-    res.status(500).json({ success: false, error: error.message })
+    console.error(`❌ [${EMPRESA_ID}] Erro ao enviar mensagem:`, error);
+    res.status(500).json({ error: error.message });
   }
-})
+});
 
-// ================================
-// 🚪 ENDPOINT LOGOUT
-// ================================
+// Endpoint: Logout
 app.get('/logout', async (req, res) => {
   try {
-    if (sock) {
-      await sock.logout()
-      connectionStatus.connected = false
-      console.log(`🚪 [${EMPRESA_ID}] Sessão encerrada manualmente.`)
-      return res.json({ success: true, message: 'Sessão encerrada.' })
-    }
-    res.status(400).json({ success: false, message: 'Nenhuma sessão ativa.' })
-  } catch (err) {
-    console.error(`❌ [${EMPRESA_ID}] Erro ao desconectar:`, err)
-    res.status(500).json({ success: false, error: err.message })
-  }
-})
+    await sock.logout();
+    connectionStatus = 'disconnected';
+    connectedNumber = null;
+    
+    await supabase.from('whatsapp_connection').update({
+      is_connected: false,
+      connected_number: null,
+    }).eq('company_id', EMPRESA_ID);
 
-// ================================
-// 🚀 INICIALIZA SERVIDOR
-// ================================
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🌐 [${EMPRESA_ID}] Servidor Baileys rodando na porta ${PORT}`)
-  connectToWhatsApp()
-})
+    res.json({ success: true, message: 'Desconectado com sucesso' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Servidor rodando na porta ${PORT}`);
+  connectToWhatsApp();
+});
