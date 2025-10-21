@@ -101,15 +101,13 @@ async function connectToWhatsApp() {
     let type = 'text'
     let mediaBase64 = null
 
-    // ================================
     // 🖼️ BUSCAR FOTO DE PERFIL
-    // ================================
     let profilePicUrl = null
     try {
       profilePicUrl = await sock.profilePictureUrl(sender, 'image')
       console.log(`🖼️ [${EMPRESA_ID}] Foto de perfil capturada para ${sender}`)
     } catch (err) {
-      console.log(`⚠️ [${EMPRESA_ID}] Sem foto de perfil pública para ${sender}`)
+      console.log(`⚠️ [${EMPRESA_ID}] Sem foto pública para ${sender}`)
       // Não é erro crítico, alguns contatos não têm foto pública
     }
 
@@ -153,7 +151,7 @@ async function connectToWhatsApp() {
         to: connectionStatus.number,           // ✅ Número da IRIS (quem recebeu)
         message: content,
         name: pushName,
-        profilePicUrl: profilePicUrl,          // ✅ NOVO: URL da foto de perfil
+        profilePicUrl: profilePicUrl,          // ✅ FOTO DE PERFIL
         type,
         media: mediaBase64,
         fromMe: false                          // ✅ Explicitamente FALSE
