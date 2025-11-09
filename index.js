@@ -1,299 +1,352 @@
-// IMPORTANTE: Carregar variáveis ANTES de qualquer outra coisa
-import dotenv from 'dotenv';
-dotenv.config();
+import { Boom } from '@hapi/boom'
+import { createClient } from '@supabase/supabase-js'
+import {
+  DisconnectReason,
+  downloadMediaMessage,
+  makeWASocket,
+  useMultiFileAuthState
+} from '@whiskeysockets/baileys'
+import dotenv from 'dotenv'
+import express from 'express'
+import fetch from 'node-fetch'
+import P from 'pino'
+import qrcode from 'qrcode-terminal'
+import crypto from 'crypto';
 
-import { Boom } from '@hapi/boom';
-import makeWASocket, { 
-  DisconnectReason, 
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion 
-} from '@whiskeysockets/baileys';
-import express from 'express';
-import qrcode from 'qrcode';
-import { createClient } from '@supabase/supabase-js';
 
-// ===== CONFIGURAÇÕES =====
-const PORT = process.env.PORT || 10000;
-const EMPRESA_ID = process.env.EMPRESA_ID;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const BAILEYS_WEBHOOK_SECRET = process.env.BAILEYS_WEBHOOK_SECRET || 'default-secret';
+dotenv.config()
 
-// Log para debug
-console.log('🔍 Verificando variáveis de ambiente:');
-console.log('   PORT:', PORT);
-console.log('   EMPRESA_ID:', EMPRESA_ID ? '✅ Definido' : '❌ Não definido');
-console.log('   SUPABASE_URL:', SUPABASE_URL ? '✅ Definido' : '❌ Não definido');
-console.log('   SUPABASE_ANON_KEY:', SUPABASE_ANON_KEY ? '✅ Definido' : '❌ Não definido');
+// ================================
+// 🔧 CONFIGURAÇÕES GERAIS
+// ================================
+const PORT = process.env.PORT || 10000
+const EMPRESA_ID = process.env.EMPRESA_ID || 'empresa-desconhecida'
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://ssbuwpeasbkxobowfyvw.supabase.co"
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+const BAILEYS_WEBHOOK_SECRET = "29892e8957b5a37fb9f3880e3e5b73231b1caa445d7fac035a3383a0b4403f17"
 
-// Validar variáveis críticas
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-  console.error('\n❌ ERRO CRÍTICO: Variáveis de ambiente não foram carregadas!');
-  console.error('📝 Verifique se o arquivo .env existe em:', process.cwd());
-  console.error('📝 Conteúdo esperado do .env:');
-  console.error('   PORT=10000');
-  console.error('   EMPRESA_ID=03e6a1b3-e741-4dbc-a0bc-0d922ecd0a12');
-  console.error('   SUPABASE_URL=https://...');
-  console.error('   SUPABASE_ANON_KEY=eyJ...');
-  process.exit(1);
-}
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+const app = express()
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-console.log('✅ Cliente Supabase criado com sucesso\n');
+// ✅ CORREÇÃO: Aumentar limite de payload para 50MB
+app.use(express.json({ limit: '50mb' }))
+app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
-// ===== ESTADO GLOBAL =====
-let sock = null;
-let lastQR = null;
+let sock = null
 let connectionStatus = {
   connected: false,
   number: null,
-  lastUpdate: new Date().toISOString()
-};
-
-// ===== EXPRESS API =====
-const app = express();
-app.use(express.json());
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    env_loaded: !!SUPABASE_URL
-  });
-});
-
-// Status da conexão
-app.get('/status', (req, res) => {
-  res.json({
-    connected: connectionStatus.connected,
-    number: connectionStatus.number,
-    lastUpdate: connectionStatus.lastUpdate,
-    hasQR: !!lastQR
-  });
-});
-
-// Obter QR Code
-app.get('/qr', (req, res) => {
-  if (!lastQR) {
-    return res.status(404).json({ 
-      error: 'QR code não disponível',
-      message: connectionStatus.connected 
-        ? 'WhatsApp já está conectado' 
-        : 'Aguardando geração do QR code...'
-    });
-  }
-  
-  res.json({ 
-    qr: lastQR,
-    message: 'QR code disponível para escaneamento'
-  });
-});
-
-// Enviar mensagem
-app.post('/send-message', async (req, res) => {
-  try {
-    const { to, message, mediaUrl } = req.body;
-    
-    if (!connectionStatus.connected || !sock) {
-      return res.status(503).json({ 
-        error: 'WhatsApp não conectado',
-        connected: false
-      });
-    }
-
-    const jid = to.includes('@s.whatsapp.net') ? to : `${to}@s.whatsapp.net`;
-
-    let sentMessage;
-    if (mediaUrl) {
-      sentMessage = await sock.sendMessage(jid, {
-        image: { url: mediaUrl },
-        caption: message || ''
-      });
-    } else {
-      sentMessage = await sock.sendMessage(jid, { text: message });
-    }
-
-    console.log('✅ Mensagem enviada:', { to: jid, message });
-    res.json({ 
-      success: true, 
-      messageId: sentMessage.key.id 
-    });
-
-  } catch (error) {
-    console.error('❌ Erro ao enviar mensagem:', error);
-    res.status(500).json({ 
-      error: 'Erro ao enviar mensagem',
-      details: error.message 
-    });
-  }
-});
-
-// Logout
-app.post('/logout', async (req, res) => {
-  try {
-    if (sock) {
-      await sock.logout();
-      connectionStatus.connected = false;
-      connectionStatus.number = null;
-      lastQR = null;
-      console.log('✅ Logout realizado com sucesso');
-    }
-    res.json({ success: true, message: 'Logout realizado' });
-  } catch (error) {
-    console.error('❌ Erro no logout:', error);
-    res.status(500).json({ 
-      error: 'Erro ao fazer logout',
-      details: error.message 
-    });
-  }
-});
-
-// Iniciar servidor Express
-app.listen(PORT, () => {
-  console.log(`\n✅ Servidor HTTP rodando na porta ${PORT}`);
-  console.log(`📍 Endpoints disponíveis:`);
-  console.log(`   - GET  http://localhost:${PORT}/health`);
-  console.log(`   - GET  http://localhost:${PORT}/status`);
-  console.log(`   - GET  http://localhost:${PORT}/qr`);
-  console.log(`   - POST http://localhost:${PORT}/send-message`);
-  console.log(`   - POST http://localhost:${PORT}/logout\n`);
-});
-
-// ===== BAILEYS WHATSAPP =====
-async function connectToWhatsApp() {
-  console.log('🔄 Iniciando conexão com WhatsApp...\n');
-  
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-  const { version } = await fetchLatestBaileysVersion();
-
-  sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    markOnlineOnConnect: true,
-    syncFullHistory: false,
-  });
-
-  // ===== EVENT: ATUALIZAÇÃO DE CONEXÃO =====
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    // QR Code gerado
-    if (qr) {
-      lastQR = qr;
-      connectionStatus.lastUpdate = new Date().toISOString();
-      
-      console.log('\n╔═══════════════════════════════════════════╗');
-      console.log('║   📱 QR CODE - ESCANEIE COM SEU WHATSAPP  ║');
-      console.log('╚═══════════════════════════════════════════╝\n');
-      
-      // Gerar QR code no terminal
-      qrcode.toString(qr, { type: 'terminal', small: true }, (err, url) => {
-        if (!err) {
-          console.log(url);
-          console.log('\n╔═══════════════════════════════════════════╗');
-          console.log('║  👆 Escaneie o QR Code acima com o app   ║');
-          console.log('╚═══════════════════════════════════════════╝\n');
-        }
-      });
-    }
-
-    // Conexão estabelecida
-    if (connection === 'open') {
-      lastQR = null;
-      connectionStatus.connected = true;
-      connectionStatus.lastUpdate = new Date().toISOString();
-      
-      const user = sock.user;
-      const phoneNumber = user?.id?.split(':')[0] || 'Desconhecido';
-      connectionStatus.number = phoneNumber;
-
-      console.log('\n✅ ═══════════════════════════════════');
-      console.log('✅ CONECTADO AO WHATSAPP COM SUCESSO!');
-      console.log('✅ ═══════════════════════════════════');
-      console.log('📱 Número:', phoneNumber);
-      console.log('🕐 Horário:', new Date().toLocaleString('pt-BR'));
-      console.log('═══════════════════════════════════\n');
-
-      // Atualizar no Supabase
-      try {
-        await supabase
-          .from('whatsapp_connection')
-          .update({
-            is_connected: true,
-            connected_number: phoneNumber,
-            last_connected_at: new Date().toISOString()
-          })
-          .eq('company_id', EMPRESA_ID);
-        
-        console.log('✅ Status atualizado no banco de dados\n');
-      } catch (error) {
-        console.error('⚠️  Erro ao atualizar banco:', error.message);
-      }
-    }
-
-    // Conexão fechada
-    if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error instanceof Boom)
-        ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
-        : true;
-
-      connectionStatus.connected = false;
-      connectionStatus.lastUpdate = new Date().toISOString();
-
-      console.log('\n❌ Conexão fechada');
-      console.log('📝 Motivo:', lastDisconnect?.error?.message || 'Desconhecido');
-
-      if (shouldReconnect) {
-        console.log('🔄 Reconectando em 5 segundos...\n');
-        setTimeout(connectToWhatsApp, 5000);
-      } else {
-        console.log('🚪 Sessão encerrada (logout manual)\n');
-        connectionStatus.number = null;
-      }
-    }
-  });
-
-  // ===== EVENT: CREDENCIAIS ATUALIZADAS =====
-  sock.ev.on('creds.update', saveCreds);
-
-  // ===== EVENT: MENSAGENS RECEBIDAS =====
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    for (const msg of messages) {
-      // Ignorar mensagens enviadas por nós
-      if (msg.key.fromMe) continue;
-
-      const remoteJid = msg.key.remoteJid;
-      const messageText = msg.message?.conversation 
-        || msg.message?.extendedTextMessage?.text 
-        || '';
-
-      console.log('📨 Nova mensagem recebida:');
-      console.log('   De:', remoteJid);
-      console.log('   Texto:', messageText.substring(0, 100));
-
-      // Salvar no Supabase
-      try {
-        await supabase.from('chat_messages').insert({
-          company_id: EMPRESA_ID,
-          phone: remoteJid.split('@')[0],
-          message_text: messageText,
-          sender_name: msg.pushName || 'Desconhecido',
-          from_me: false,
-          whatsapp_message_id: msg.key.id
-        });
-
-        console.log('   ✅ Salva no banco de dados\n');
-      } catch (error) {
-        console.error('   ❌ Erro ao salvar:', error.message, '\n');
-      }
-    }
-  });
+  lastUpdate: null
 }
 
-// Iniciar conexão WhatsApp
-connectToWhatsApp().catch(err => {
-  console.error('❌ Erro fatal ao conectar:', err);
-  process.exit(1);
-});
+function generateWebhookSignature(bodyString, secret) {
+  return crypto
+    .createHmac('sha256', secret)
+    .update(bodyString)
+    .digest('hex');
+}
+
+// ================================
+// 🔐 CONEXÃO COM WHATSAPP
+// ================================
+async function connectToWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState('./session')
+  // const { version } = await fetchLatestBaileysVersion()
+
+  sock = makeWASocket({
+    // version,
+    printQRInTerminal: false,
+    auth: state,
+    logger: P({ level: 'silent' }),
+    browser: ['IRIS CRM', 'Chrome', '4.0']
+  })
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update
+
+    if (qr) {
+      console.clear()
+      console.log(`📱 [${EMPRESA_ID}] Escaneie o QR Code abaixo para conectar o WhatsApp:`)
+      qrcode.generate(qr, { small: true })
+    }
+
+    if (connection === 'close') {
+      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
+      console.log(`⚠️ [${EMPRESA_ID}] Conexão encerrada:`, reason)
+      connectionStatus.connected = false
+      connectionStatus.number = null
+      if (reason !== DisconnectReason.loggedOut) {
+        console.log('🔄 Tentando reconectar...')
+        connectToWhatsApp()
+      }
+    }
+
+    if (connection === 'open') {
+      const user = sock?.user?.id?.split(':')[0]
+      console.log(`✅ [${EMPRESA_ID}] WhatsApp conectado com sucesso! Número: ${user}`)
+      connectionStatus = {
+        connected: true,
+        number: user,
+        lastUpdate: new Date().toISOString()
+      }
+    }
+  })
+
+  // ================================
+  // 💬 RECEBIMENTO DE MENSAGENS
+  // ================================
+  // ✅ CORREÇÃO: Remover listeners antigos para evitar duplicação
+  sock.ev.removeAllListeners('messages.upsert')
+
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0]
+    if (!msg.message) return
+
+    // ⚠️ CRÍTICO: Ignorar mensagens enviadas pela própria IRIS
+    if (msg.key.fromMe) {
+      console.log(`⏭️ [${EMPRESA_ID}] Mensagem ignorada (fromMe: true)`)
+      return
+    }
+
+    // ✅ CORREÇÃO CRÍTICA: Preservar remoteJid completo (com @lid ou @s.whatsapp.net)
+    const remoteJid = msg.key.remoteJid
+    const isLidFormat = remoteJid.includes('@lid')
+    const pushName = msg.pushName || 'Cliente'
+    const messageId = msg.key.id
+    
+    let content = ''
+    let type = 'text'
+    let mediaBase64 = null
+
+    try {
+      if (msg.message.conversation) {
+        content = msg.message.conversation
+      } else if (msg.message.extendedTextMessage) {
+        content = msg.message.extendedTextMessage.text
+      } else if (msg.message.imageMessage) {
+        type = 'image'
+        content = msg.message.imageMessage.caption || ''
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
+        mediaBase64 = `data:${msg.message.imageMessage.mimetype};base64,${buffer.toString('base64')}`
+      } else if (msg.message.audioMessage) {
+        type = 'audio'
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
+        mediaBase64 = `data:${msg.message.audioMessage.mimetype};base64,${buffer.toString('base64')}`
+      } else if (msg.message.videoMessage) {
+        type = 'video'
+        content = msg.message.videoMessage.caption || ''
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
+        mediaBase64 = `data:${msg.message.videoMessage.mimetype};base64,${buffer.toString('base64')}`
+      } else if (msg.message.documentMessage) {
+        type = 'document'
+        content = msg.message.documentMessage.fileName || 'Arquivo recebido'
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) })
+        mediaBase64 = `data:${msg.message.documentMessage.mimetype};base64,${buffer.toString('base64')}`
+      }
+
+      console.log(`📩 [${EMPRESA_ID}] Mensagem ${isLidFormat ? '[FACEBOOK ADS @lid]' : '[WhatsApp normal]'} RECEBIDA de ${remoteJid}: ${content.substring(0, 50)} [ID: ${messageId}]`)
+
+      // ✅ CORREÇÃO: NÃO salvar no Supabase aqui - deixar o webhook fazer isso
+      // Isso evita duplicação de mensagens
+
+      // ================================
+      // 🔔 ENVIO DO WEBHOOK (CORRIGIDO)
+      // ================================
+      const webhookPayload = {
+        from: remoteJid,  // ✅ JID COMPLETO (com @lid ou @s.whatsapp.net)
+        to: `${connectionStatus.number}@s.whatsapp.net`,
+        message: content,  // ✅ STRING simples
+        messageId: messageId,
+        name: pushName,
+        type,
+        media: mediaBase64,
+        fromMe: false
+      }
+
+      console.log(`🔔 [${EMPRESA_ID}] Enviando para baileys-webhook-adapter com messageId: ${messageId}`)
+
+      const bodyString = JSON.stringify(webhookPayload);
+      const signature = generateWebhookSignature(bodyString, BAILEYS_WEBHOOK_SECRET);
+
+      // ✅ CORREÇÃO: URL corrigida para baileys-webhook-adapter
+      const webhookUrl = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook-adapter";
+      
+      console.log("📤 Chamando webhook:", webhookUrl);
+      console.log("📊 Dados:", {
+        isLidFormat,
+        from: remoteJid,
+        name: pushName,
+        messagePreview: content.substring(0, 30)
+      });
+
+      const response = await fetch(webhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Empresa-ID": EMPRESA_ID,  // ✅ Header correto
+          "X-Webhook-Signature": signature
+        },
+        body: bodyString
+      })
+
+      if (response.ok) {
+        const responseData = await response.json()
+        console.log(`✅ [${EMPRESA_ID}] Webhook processado:`, responseData)
+      } else {
+        const errorText = await response.text()
+        console.error(`⚠️ [${EMPRESA_ID}] Webhook erro ${response.status}:`, errorText)
+      }
+
+    } catch (err) {
+      console.error(`❌ [${EMPRESA_ID}] Erro no recebimento:`, err.message)
+    }
+  })
+
+  sock.ev.on('creds.update', saveCreds)
+}
+
+// ================================
+// 📡 ENDPOINT STATUS
+// ================================
+app.get('/status', (req, res) => {
+  res.json({
+    success: true,
+    empresa_id: EMPRESA_ID,
+    connected: connectionStatus.connected,
+    number: connectionStatus.number,
+    lastUpdate: connectionStatus.lastUpdate
+  })
+})
+
+// ================================
+// ✉️ ENDPOINT ENVIO DE MENSAGEM
+// ================================
+app.post('/send-message', async (req, res) => {
+  try {
+    const { number, message, type, media, fileName } = req.body
+    if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
+
+    const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
+    let sentMsg = null
+
+    console.log(`📤 [${EMPRESA_ID}] Enviando para ${jid}:`, {
+      hasMedia: !!media,
+      type: type || 'text',
+      fileName: fileName || 'N/A'
+    })
+
+    if (media && type && type !== 'text') {
+      // ✅ CORREÇÃO: Verificar se media já está em base64 ou é URL
+      let mediaBuffer;
+
+      if (media.startsWith('data:')) {
+        // Já está em base64 (formato: data:mime/type;base64,xxxxx)
+        const base64Data = media.split(',')[1];
+        if (!base64Data) {
+          throw new Error('Invalid base64 format');
+        }
+        mediaBuffer = Buffer.from(base64Data, 'base64');
+        console.log(`✅ [${EMPRESA_ID}] Base64 recebido, tamanho:`, mediaBuffer.length);
+      } else if (media.startsWith('http')) {
+        // ⚠️ FALLBACK: Se ainda vier URL, baixar aqui
+        console.log(`⚠️ [${EMPRESA_ID}] Recebeu URL, baixando...`);
+        const response = await fetch(media);
+        mediaBuffer = Buffer.from(await response.arrayBuffer());
+        console.log(`✅ [${EMPRESA_ID}] Download concluído, tamanho:`, mediaBuffer.length);
+      } else {
+        throw new Error('Media format not supported');
+      }
+
+      // Enviar com base no tipo
+      if (type === 'image') {
+        sentMsg = await sock.sendMessage(jid, {
+          image: mediaBuffer,
+          caption: message || ''
+        });
+      } else if (type === 'audio') {
+        sentMsg = await sock.sendMessage(jid, {
+          audio: mediaBuffer,
+          mimetype: 'audio/mp4',
+          ptt: true
+        });
+      } else if (type === 'video') {
+        sentMsg = await sock.sendMessage(jid, {
+          video: mediaBuffer,
+          caption: message || ''
+        });
+      } else if (type === 'document') {
+        // ✅ CORREÇÃO: Determinar mimetype correto
+        let mimetype = 'application/pdf';
+        if (fileName) {
+          const ext = fileName.split('.').pop()?.toLowerCase();
+          const mimeMap = {
+            'pdf': 'application/pdf',
+            'doc': 'application/msword',
+            'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'xls': 'application/vnd.ms-excel',
+            'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+          };
+          mimetype = mimeMap[ext] || 'application/pdf';
+        }
+
+        sentMsg = await sock.sendMessage(jid, {
+          document: mediaBuffer,
+          mimetype: mimetype,
+          fileName: fileName || 'arquivo.pdf'
+        });
+
+        console.log(`📎 [${EMPRESA_ID}] Documento enviado:`, fileName);
+      }
+    } else {
+      sentMsg = await sock.sendMessage(jid, { text: message })
+    }
+
+    console.log(`✅ [${EMPRESA_ID}] Mensagem enviada com sucesso.`)
+
+    await supabase.from('chat_mensagens').insert([
+      {
+        remetente: connectionStatus.number,
+        destinatario: number,
+        mensagem: message || '(mídia)',
+        tipo: type || 'text',
+        data_envio: new Date(),
+        empresa_id: EMPRESA_ID
+      }
+    ])
+
+    res.json({
+      success: true,
+      message: 'Mensagem enviada com sucesso.',
+      messageId: sentMsg?.key?.id
+    })
+  } catch (error) {
+    console.error(`❌ [${EMPRESA_ID}] Erro ao enviar mensagem:`, error)
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// ================================
+// 🚪 ENDPOINT LOGOUT
+// ================================
+app.get('/logout', async (req, res) => {
+  try {
+    if (sock) {
+      await sock.logout()
+      connectionStatus.connected = false
+      console.log(`🚪 [${EMPRESA_ID}] Sessão encerrada manualmente.`)
+      return res.json({ success: true, message: 'Sessão encerrada.' })
+    }
+    res.status(400).json({ success: false, message: 'Nenhuma sessão ativa.' })
+  } catch (err) {
+    console.error(`❌ [${EMPRESA_ID}] Erro ao desconectar:`, err)
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// ================================
+// 🚀 INICIALIZA SERVIDOR
+// ================================
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🌐 [${EMPRESA_ID}] Servidor rodando na porta ${PORT}`)
+  connectToWhatsApp()
+})
