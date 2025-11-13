@@ -113,7 +113,7 @@ async function connectToWhatsApp() {
     const isLidFormat = remoteJid.includes('@lid')
     const pushName = msg.pushName || 'Cliente'
     const messageId = msg.key.id
-    
+
     let content = ''
     let type = 'text'
     let mediaBase64 = null
@@ -170,7 +170,7 @@ async function connectToWhatsApp() {
 
       // ✅ CORREÇÃO: URL corrigida para baileys-webhook-adapter
       const webhookUrl = "https://ssbuwpeasbkxobowfyvw.supabase.co/functions/v1/baileys-webhook-adapter";
-      
+
       console.log("📤 Chamando webhook:", webhookUrl);
       console.log("📊 Dados:", {
         isLidFormat,
@@ -219,35 +219,41 @@ app.get('/status', (req, res) => {
 })
 
 // ================================
-// ✉️ ENDPOINT ENVIO DE MENSAGEM
+// 📤 ENDPOINT ENVIO DE MENSAGEM
 // ================================
 app.post('/send-message', async (req, res) => {
   try {
-    const { number, message, type, media, fileName } = req.body
-    if (!number) return res.status(400).json({ success: false, error: 'Número é obrigatório.' })
+    const { number, message, media, type, fileName } = req.body
 
-    const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`
-    let sentMsg = null
+    if (!sock || !connectionStatus.connected) {
+      return res.status(503).json({
+        success: false,
+        error: 'WhatsApp não conectado.'
+      })
+    }
 
-    console.log(`📤 [${EMPRESA_ID}] Enviando para ${jid}:`, {
-      hasMedia: !!media,
-      type: type || 'text',
-      fileName: fileName || 'N/A'
-    })
+    if (!number) {
+      return res.status(400).json({ success: false, error: 'Número não fornecido.' })
+    }
 
-    if (media && type && type !== 'text') {
-      // ✅ CORREÇÃO: Verificar se media já está em base64 ou é URL
+    let jid = number
+    if (!jid.includes('@')) {
+      jid = `${number}@s.whatsapp.net`
+    }
+
+    console.log(`📤 [${EMPRESA_ID}] Enviando mensagem para ${jid}...`)
+
+    let sentMsg
+    if (media) {
       let mediaBuffer;
 
+      // ✅ CORREÇÃO: Aceitar tanto base64 quanto URL
       if (media.startsWith('data:')) {
-        // Já está em base64 (formato: data:mime/type;base64,xxxxx)
+        console.log(`📦 [${EMPRESA_ID}] Media em base64, convertendo...`);
         const base64Data = media.split(',')[1];
-        if (!base64Data) {
-          throw new Error('Invalid base64 format');
-        }
         mediaBuffer = Buffer.from(base64Data, 'base64');
-        console.log(`✅ [${EMPRESA_ID}] Base64 recebido, tamanho:`, mediaBuffer.length);
-      } else if (media.startsWith('http')) {
+        console.log(`✅ [${EMPRESA_ID}] Conversão concluída, tamanho:`, mediaBuffer.length);
+      } else if (media.startsWith('http://') || media.startsWith('https://')) {
         // ⚠️ FALLBACK: Se ainda vier URL, baixar aqui
         console.log(`⚠️ [${EMPRESA_ID}] Recebeu URL, baixando...`);
         const response = await fetch(media);
@@ -303,16 +309,9 @@ app.post('/send-message', async (req, res) => {
 
     console.log(`✅ [${EMPRESA_ID}] Mensagem enviada com sucesso.`)
 
-    await supabase.from('chat_mensagens').insert([
-      {
-        remetente: connectionStatus.number,
-        destinatario: number,
-        mensagem: message || '(mídia)',
-        tipo: type || 'text',
-        data_envio: new Date(),
-        empresa_id: EMPRESA_ID
-      }
-    ])
+    // ✅ CORREÇÃO CRÍTICA: Removido código que tentava salvar na tabela 'chat_mensagens'
+    // A tabela não existe mais. As mensagens são salvas automaticamente via webhook.
+    // Linhas 306-315 do arquivo original foram removidas.
 
     res.json({
       success: true,
